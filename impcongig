@@ -1,0 +1,278 @@
+# ============================================================
+# COMBINED PREPROCESSING CONFIG
+# ============================================================
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+paths:
+
+  input_root: "C:/Users/laka/software/classification_laka"
+
+  output_root: "C:/Users/laka/software/classification_laka_processed_combined"
+
+
+# ============================================================
+# DATASETS
+# ============================================================
+
+datasets:
+
+  - position: "ViTop"
+    labels:
+      - "Good"
+      - "Bad"
+
+  - position: "ViBottom"
+    labels:
+      - "Good"
+      - "Bad"
+
+
+# ============================================================
+# COMMON
+# ============================================================
+
+common:
+
+  final_size: 600
+
+  image_extensions:
+    - ".bmp"
+    - ".png"
+    - ".jpg"
+    - ".jpeg"
+    - ".tif"
+    - ".tiff"
+
+  lighting:
+
+    dark_threshold: 0.22
+
+    max_brighten: 0.10
+
+
+# ============================================================
+# OUTPUT
+# ============================================================
+
+output:
+
+  debug_folder: "_debug"
+
+  missing_folder: "Missing"
+
+  debug_missing_folder: "_debug_missing"
+
+  save_debug: true
+
+  copy_original_on_failure: true
+
+
+# ============================================================
+# ViTop
+# ============================================================
+
+vitop:
+
+  # Extra border around detected die
+  offset_ratio: 0.04
+
+  # Central search region
+  search_ratio: 0.62
+
+  max_center_offset_x: 0.20
+  max_center_offset_y: 0.20
+
+  min_size_ratio: 0.08
+  max_size_ratio: 0.42
+  expected_size_ratio: 0.18
+
+  min_detection_score: 7.0
+
+  max_rotation_deg: 15.0
+
+
+  method:
+
+    # --------------------------------------------------------
+    # PREPROCESSING
+    # --------------------------------------------------------
+
+    blur_kernel: 5
+
+    clahe_clip_limit: 2.5
+
+    clahe_tile_size: 8
+
+
+    # --------------------------------------------------------
+    # CANNY
+    # --------------------------------------------------------
+
+    canny_min_low: 10
+
+    canny_low_factor: 0.60
+
+    canny_min_gap: 30
+
+    canny_high_factor: 1.40
+
+
+    # --------------------------------------------------------
+    # MORPHOLOGY
+    # --------------------------------------------------------
+
+    large_morph_kernel: 9
+
+    small_morph_kernel: 5
+
+    bright_close_iterations: 2
+
+    bright_open_iterations: 1
+
+    edge_close_iterations: 3
+
+    edge_dilate_iterations: 1
+
+
+    # --------------------------------------------------------
+    # CANDIDATE GEOMETRY
+    # --------------------------------------------------------
+
+    min_pixel_side: 5
+
+    max_aspect: 1.70
+
+
+    # --------------------------------------------------------
+    # CANDIDATE SCORE
+    # --------------------------------------------------------
+
+    score_center_weight: 10.0
+
+    score_square_weight: 2.0
+
+    score_fill_weight: 1.5
+
+    score_size_weight: 1.5
+
+
+    # --------------------------------------------------------
+    # RECTIFICATION
+    # --------------------------------------------------------
+
+    minimum_native_size: 100
+
+
+# ============================================================
+# ViBottom
+# ============================================================
+
+vibottom:
+
+  # Extra border around die
+  offset_ratio: 0.03
+
+  max_center_offset_x: 0.34
+  max_center_offset_y: 0.34
+
+  min_side_ratio: 0.14
+  max_side_ratio: 0.52
+
+  min_detection_score: 3.0
+
+  max_rotation_deg: 18.0
+
+  # Search around expected edge
+  edge_search_ratio: 0.28
+
+
+  method:
+
+    # --------------------------------------------------------
+    # ROUGH DETECTION
+    # --------------------------------------------------------
+
+    rough_blur_sigma_min: 12.0
+
+    rough_blur_sigma_ratio: 0.018
+
+
+    threshold_percentiles:
+      - 60
+      - 66
+      - 72
+
+
+    # --------------------------------------------------------
+    # MORPHOLOGY
+    # --------------------------------------------------------
+
+    close_kernel_min: 15
+
+    close_kernel_ratio: 0.025
+
+    close_iterations: 2
+
+
+    # --------------------------------------------------------
+    # CANDIDATE GEOMETRY
+    # --------------------------------------------------------
+
+    min_pixel_side: 10
+
+    max_aspect: 1.55
+
+
+    # --------------------------------------------------------
+    # CONTRAST / EXPECTED SIZE
+    # --------------------------------------------------------
+
+    contrast_outer_scale: 1.28
+
+    expected_side_ratio: 0.28
+
+
+    # --------------------------------------------------------
+    # CANDIDATE SCORE
+    # --------------------------------------------------------
+
+    score_contrast_weight: 3.5
+
+    score_square_weight: 2.5
+
+    score_fill_weight: 2.0
+
+    score_size_weight: 1.0
+
+
+    # --------------------------------------------------------
+    # EDGE REFINEMENT
+    # --------------------------------------------------------
+
+    refine_blur_sigma_min: 8.0
+
+    refine_blur_sigma_ratio: 0.035
+
+    central_band_half_ratio: 0.30
+
+
+    # --------------------------------------------------------
+    # 1-D PROFILE
+    # --------------------------------------------------------
+
+    profile_smooth_kernel_min: 9
+
+    profile_smooth_kernel_ratio: 0.01
+
+
+    # --------------------------------------------------------
+    # REFINED SIZE SANITY CHECK
+    # --------------------------------------------------------
+
+    refined_span_min_scale: 0.65
+
+    refined_span_max_scale: 1.35

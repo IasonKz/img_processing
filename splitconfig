@@ -1,0 +1,108 @@
+# ============================================================
+# COMBINED DATASET SPLIT CONFIG
+# ============================================================
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+paths:
+
+  input_root: "C:/Users/laka/software/classification_laka_processed_combined"
+
+  output_root: "C:/Users/laka/software/classification_laka_split"
+
+
+# ============================================================
+# DATASETS
+# ============================================================
+
+datasets:
+
+  - name: "ViTop"
+    input_folder: "ViTop"
+    augment: true
+
+  - name: "ViBottom"
+    input_folder: "ViBottom"
+    augment: true
+
+
+# ============================================================
+# CLASSES
+# ============================================================
+
+classes:
+
+  - "Good"
+
+  - "Bad"
+
+
+# ============================================================
+# TRAIN / VALIDATION / TEST
+# ============================================================
+
+splits:
+
+  train: 0.70
+
+  validation: 0.15
+
+  test: 0.15
+
+
+# ============================================================
+# REPRODUCIBILITY
+# ============================================================
+
+random_seed: 42
+
+
+# ============================================================
+# DATA AUGMENTATION
+# ============================================================
+
+augmentation:
+
+  enabled: true
+
+  # Augmentation ONLY after splitting and ONLY in training
+  apply_to_splits:
+    - "train"
+
+  rotations_degrees:
+    - 90
+    - 180
+    - 270
+
+
+# ============================================================
+# IMAGE TYPES
+# ============================================================
+
+images:
+
+  extensions:
+    - ".bmp"
+    - ".png"
+    - ".jpg"
+    - ".jpeg"
+    - ".tif"
+    - ".tiff"
+
+
+# ============================================================
+# OUTPUT SAFETY
+# ============================================================
+
+output:
+
+  clean_output_before_run: false
+
+  existing_files: "error"
+
+  manifest_csv: "split_manifest.csv"
+
+  copy_file_metadata: true

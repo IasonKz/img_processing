@@ -1,0 +1,3607 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+NILT combined preprocessing for ViTop + ViBottom.
+
+This is the same no-ECC / no-reference pipeline as the previous combined
+script, but paths and tunable parameters are loaded from an external YAML file.
+
+Run:
+    python combined_preprocessing_config.py --config config.yaml
+
+Dependencies:
+    pip install opencv-python numpy pyyaml
+"""
+
+from pathlib import Path
+import argparse
+import os
+import shutil
+import cv2
+import numpy as np
+import yaml
+
+
+# ============================================================
+# GLOBALS FILLED FROM YAML
+# ============================================================
+
+INPUT_ROOT = None
+OUTPUT_ROOT = None
+DATASETS = []
+IMAGE_EXTENSIONS = set()
+
+FINAL_SIZE = None
+TOP_OFFSET_RATIO = None
+BOTTOM_OFFSET_RATIO = None
+DARK_THRESHOLD = None
+MAX_BRIGHTEN = None
+
+TOP_SEARCH_RATIO = None
+TOP_MAX_CENTER_OFFSET_X = None
+TOP_MAX_CENTER_OFFSET_Y = None
+TOP_MIN_SIZE_RATIO = None
+TOP_MAX_SIZE_RATIO = None
+TOP_EXPECTED_SIZE_RATIO = None
+TOP_MIN_DETECTION_SCORE = None
+TOP_MAX_ROTATION_DEG = None
+
+BOTTOM_MAX_CENTER_OFFSET_X = None
+BOTTOM_MAX_CENTER_OFFSET_Y = None
+BOTTOM_MIN_SIDE_RATIO = None
+BOTTOM_MAX_SIDE_RATIO = None
+BOTTOM_MAX_ROTATION_DEG = None
+BOTTOM_MIN_DETECTION_SCORE = None
+BOTTOM_EDGE_SEARCH_RATIO = None
+
+TOP_METHOD = {}
+BOTTOM_METHOD = {}
+OUTPUT_NAMES = {}
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Combined ViTop/ViBottom preprocessing using YAML config."
+    )
+
+    parser.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="Path to YAML config file, for example: --config config.yaml",
+    )
+
+    return parser.parse_args()
+
+
+def resolve_config_path(value, config_dir):
+    """
+    Expand environment variables and ~.
+    Relative paths are interpreted relative to config.yaml.
+    """
+
+    value = os.path.expandvars(
+        os.path.expanduser(
+            str(value)
+        )
+    )
+
+    path = Path(value)
+
+    if not path.is_absolute():
+        path = config_dir / path
+
+    return path.resolve()
+
+
+def load_config(config_path):
+    config_path = config_path.expanduser().resolve()
+
+    if not config_path.is_file():
+        raise SystemExit(
+            f"Config file does not exist: {config_path}"
+        )
+
+    with config_path.open(
+        "r",
+        encoding="utf-8"
+    ) as handle:
+        config = yaml.safe_load(handle)
+
+    if not isinstance(config, dict):
+        raise SystemExit(
+            "The YAML file must contain a mapping/dictionary at the top level."
+        )
+
+    return config, config_path.parent
+
+
+def configure(config, config_dir):
+    """
+    Read every path and tunable parameter from YAML.
+
+    The image-processing functions below keep the same structure as the
+    previous combined script. The only change is that constants are no longer
+    edited inside the Python file.
+    """
+
+    global INPUT_ROOT
+    global OUTPUT_ROOT
+    global DATASETS
+    global IMAGE_EXTENSIONS
+
+    global FINAL_SIZE
+    global TOP_OFFSET_RATIO
+    global BOTTOM_OFFSET_RATIO
+    global DARK_THRESHOLD
+    global MAX_BRIGHTEN
+
+    global TOP_SEARCH_RATIO
+    global TOP_MAX_CENTER_OFFSET_X
+    global TOP_MAX_CENTER_OFFSET_Y
+    global TOP_MIN_SIZE_RATIO
+    global TOP_MAX_SIZE_RATIO
+    global TOP_EXPECTED_SIZE_RATIO
+    global TOP_MIN_DETECTION_SCORE
+    global TOP_MAX_ROTATION_DEG
+
+    global BOTTOM_MAX_CENTER_OFFSET_X
+    global BOTTOM_MAX_CENTER_OFFSET_Y
+    global BOTTOM_MIN_SIDE_RATIO
+    global BOTTOM_MAX_SIDE_RATIO
+    global BOTTOM_MAX_ROTATION_DEG
+    global BOTTOM_MIN_DETECTION_SCORE
+    global BOTTOM_EDGE_SEARCH_RATIO
+
+    global TOP_METHOD
+    global BOTTOM_METHOD
+    global OUTPUT_NAMES
+
+    try:
+        paths = config["paths"]
+        images = config["images"]
+        common = config["common"]
+        top = config["vitop"]
+        bottom = config["vibottom"]
+
+        INPUT_ROOT = resolve_config_path(
+            paths["input_root"],
+            config_dir
+        )
+
+        OUTPUT_ROOT = resolve_config_path(
+            paths["output_root"],
+            config_dir
+        )
+
+        DATASETS = []
+
+        for item in config["datasets"]:
+            DATASETS.append(
+                (
+                    str(item["position"]),
+                    str(item["label"])
+                )
+            )
+
+        IMAGE_EXTENSIONS = {
+            str(extension).lower()
+            if str(extension).startswith(".")
+            else "." + str(extension).lower()
+            for extension in images["extensions"]
+        }
+
+        FINAL_SIZE = int(
+            common["final_size"]
+        )
+
+        DARK_THRESHOLD = float(
+            common["lighting"]["dark_threshold"]
+        )
+
+        MAX_BRIGHTEN = float(
+            common["lighting"]["max_brighten"]
+        )
+
+        TOP_OFFSET_RATIO = float(
+            top["offset_ratio"]
+        )
+
+        TOP_SEARCH_RATIO = float(
+            top["search_ratio"]
+        )
+
+        TOP_MAX_CENTER_OFFSET_X = float(
+            top["max_center_offset_x"]
+        )
+
+        TOP_MAX_CENTER_OFFSET_Y = float(
+            top["max_center_offset_y"]
+        )
+
+        TOP_MIN_SIZE_RATIO = float(
+            top["min_size_ratio"]
+        )
+
+        TOP_MAX_SIZE_RATIO = float(
+            top["max_size_ratio"]
+        )
+
+        TOP_EXPECTED_SIZE_RATIO = float(
+            top["expected_size_ratio"]
+        )
+
+        TOP_MIN_DETECTION_SCORE = float(
+            top["min_detection_score"]
+        )
+
+        TOP_MAX_ROTATION_DEG = float(
+            top["max_rotation_deg"]
+        )
+
+        TOP_METHOD = dict(
+            top["method"]
+        )
+
+        BOTTOM_OFFSET_RATIO = float(
+            bottom["offset_ratio"]
+        )
+
+        BOTTOM_MAX_CENTER_OFFSET_X = float(
+            bottom["max_center_offset_x"]
+        )
+
+        BOTTOM_MAX_CENTER_OFFSET_Y = float(
+            bottom["max_center_offset_y"]
+        )
+
+        BOTTOM_MIN_SIDE_RATIO = float(
+            bottom["min_side_ratio"]
+        )
+
+        BOTTOM_MAX_SIDE_RATIO = float(
+            bottom["max_side_ratio"]
+        )
+
+        BOTTOM_MAX_ROTATION_DEG = float(
+            bottom["max_rotation_deg"]
+        )
+
+        BOTTOM_MIN_DETECTION_SCORE = float(
+            bottom["min_detection_score"]
+        )
+
+        BOTTOM_EDGE_SEARCH_RATIO = float(
+            bottom["edge_search_ratio"]
+        )
+
+        BOTTOM_METHOD = dict(
+            bottom["method"]
+        )
+
+        OUTPUT_NAMES = dict(
+            config["output_folders"]
+        )
+
+    except KeyError as error:
+        raise SystemExit(
+            f"Missing YAML setting: {error}"
+        ) from error
+
+    if FINAL_SIZE <= 0:
+        raise SystemExit(
+            "common.final_size must be positive."
+        )
+
+    if INPUT_ROOT.resolve() == OUTPUT_ROOT.resolve():
+        raise SystemExit(
+            "Safety stop: paths.input_root and paths.output_root must be different."
+        )
+
+
+# ============================================================
+# COMMON HELPERS
+# ============================================================
+
+def gray8(img):
+    """
+    Create an 8-bit grayscale COPY.
+
+    Used only for:
+        detection
+        debug
+
+    ORIGINAL IS NEVER MODIFIED.
+    """
+
+    if img.ndim == 3:
+
+        if img.shape[2] == 4:
+
+            g = cv2.cvtColor(
+                img,
+                cv2.COLOR_BGRA2GRAY
+            )
+
+        else:
+
+            g = cv2.cvtColor(
+                img,
+                cv2.COLOR_BGR2GRAY
+            )
+
+    else:
+
+        g = img.copy()
+
+
+    if g.dtype == np.uint8:
+
+        return g.copy()
+
+
+    x = g.astype(
+        np.float32
+    )
+
+
+    lo = float(
+        np.percentile(
+            x,
+            1
+        )
+    )
+
+
+    hi = float(
+        np.percentile(
+            x,
+            99
+        )
+    )
+
+
+    if hi <= lo:
+
+        hi = lo + 1.0
+
+
+    x = np.clip(
+        (x - lo) / (hi - lo),
+        0.0,
+        1.0
+    )
+
+
+    return (
+        255.0 * x
+    ).astype(
+        np.uint8
+    )
+
+
+# ============================================================
+# ORDER RECTANGLE POINTS
+# ============================================================
+
+def order_points(points):
+
+    pts = np.asarray(
+        points,
+        dtype=np.float32
+    )
+
+
+    ordered = np.zeros(
+        (4, 2),
+        dtype=np.float32
+    )
+
+
+    sums = pts.sum(
+        axis=1
+    )
+
+
+    diffs = np.diff(
+        pts,
+        axis=1
+    ).reshape(-1)
+
+
+    ordered[0] = pts[
+        np.argmin(sums)
+    ]
+
+
+    ordered[1] = pts[
+        np.argmin(diffs)
+    ]
+
+
+    ordered[2] = pts[
+        np.argmax(sums)
+    ]
+
+
+    ordered[3] = pts[
+        np.argmax(diffs)
+    ]
+
+
+    return ordered
+
+
+# ============================================================
+# ROTATION ANGLE
+# ============================================================
+
+def rectangle_angle(box):
+
+    box = order_points(
+        box
+    )
+
+
+    tl, tr, br, bl = box
+
+
+    vector = (
+        tr - tl
+    )
+
+
+    angle = np.degrees(
+        np.arctan2(
+            vector[1],
+            vector[0]
+        )
+    )
+
+
+    while angle >= 45:
+
+        angle -= 90
+
+
+    while angle < -45:
+
+        angle += 90
+
+
+    return float(
+        angle
+    )
+
+
+# ============================================================
+# FINAL RESIZE
+# ============================================================
+
+def resize_to_final(image):
+
+    H, W = image.shape[:2]
+
+
+    if (
+        H == FINAL_SIZE
+        and
+        W == FINAL_SIZE
+    ):
+
+        return image.copy()
+
+
+    if (
+        H > FINAL_SIZE
+        or
+        W > FINAL_SIZE
+    ):
+
+        interpolation = (
+            cv2.INTER_AREA
+        )
+
+    else:
+
+        interpolation = (
+            cv2.INTER_CUBIC
+        )
+
+
+    return cv2.resize(
+        image,
+        (
+            FINAL_SIZE,
+            FINAL_SIZE
+        ),
+        interpolation=interpolation
+    )
+
+
+# ============================================================
+# MILD LIGHTING
+# ============================================================
+
+def lighten_if_dark(image):
+    """
+    Very mild lighting correction.
+
+    The threshold and maximum increase come from YAML.
+    Bright images remain unchanged.
+    """
+
+    if not np.issubdtype(
+        image.dtype,
+        np.integer
+    ):
+
+        return image.copy()
+
+
+    if image.ndim == 3:
+
+        values = image.astype(
+            np.float32
+        ).mean(
+            axis=2
+        )
+
+    else:
+
+        values = image.astype(
+            np.float32
+        )
+
+
+    max_value = float(
+        np.iinfo(
+            image.dtype
+        ).max
+    )
+
+
+    brightness = float(
+        np.mean(values)
+        /
+        max_value
+    )
+
+
+    if brightness >= DARK_THRESHOLD:
+
+        return image.copy()
+
+
+    darkness = (
+        DARK_THRESHOLD
+        -
+        brightness
+    ) / DARK_THRESHOLD
+
+
+    darkness = float(
+        np.clip(
+            darkness,
+            0.0,
+            1.0
+        )
+    )
+
+
+    factor = (
+        1.0
+        +
+        MAX_BRIGHTEN
+        * darkness
+    )
+
+
+    result = (
+        image.astype(
+            np.float32
+        )
+        *
+        factor
+    )
+
+
+    result = np.clip(
+        result,
+        0,
+        max_value
+    )
+
+
+    return result.astype(
+        image.dtype
+    )
+
+
+# ============================================================
+# MISSING
+# ============================================================
+
+def save_missing(
+    image_path,
+    original,
+    missing_folder,
+    missing_debug_folder,
+    reason
+):
+
+    missing_folder.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+    missing_debug_folder.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+    destination = (
+        missing_folder
+        /
+        image_path.name
+    )
+
+
+    shutil.copy2(
+        str(image_path),
+        str(destination)
+    )
+
+
+    g = gray8(
+        original
+    )
+
+
+    debug = cv2.cvtColor(
+        g,
+        cv2.COLOR_GRAY2BGR
+    )
+
+
+    cv2.putText(
+        debug,
+        reason,
+        (
+            30,
+            60
+        ),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (
+            0,
+            0,
+            255
+        ),
+        3,
+        cv2.LINE_AA
+    )
+
+
+    debug_path = (
+        missing_debug_folder
+        /
+        (
+            image_path.stem
+            +
+            "_missing.png"
+        )
+    )
+
+
+    cv2.imwrite(
+        str(debug_path),
+        debug
+    )
+
+
+# ============================================================
+# ViTop METHOD
+# ============================================================
+
+# ============================================================
+# DETECT TOP DIE
+# ============================================================
+
+def detect_top_die(original):
+
+    g = gray8(
+        original
+    )
+
+
+    H, W = g.shape[:2]
+
+
+    image_cx = W / 2.0
+    image_cy = H / 2.0
+
+
+    search_w = int(
+        W * TOP_SEARCH_RATIO
+    )
+
+
+    search_h = int(
+        H * TOP_SEARCH_RATIO
+    )
+
+
+    sx1 = max(
+        0,
+        int(
+            image_cx
+            -
+            search_w / 2
+        )
+    )
+
+
+    sy1 = max(
+        0,
+        int(
+            image_cy
+            -
+            search_h / 2
+        )
+    )
+
+
+    sx2 = min(
+        W,
+        sx1 + search_w
+    )
+
+
+    sy2 = min(
+        H,
+        sy1 + search_h
+    )
+
+
+    roi = g[
+        sy1:sy2,
+        sx1:sx2
+    ].copy()
+
+
+    blur_kernel = int(
+        TOP_METHOD["blur_kernel"]
+    )
+
+    if blur_kernel % 2 == 0:
+        blur_kernel += 1
+
+
+    blurred = cv2.GaussianBlur(
+        roi,
+        (
+            blur_kernel,
+            blur_kernel
+        ),
+        0
+    )
+
+
+    tile = int(
+        TOP_METHOD["clahe_tile_size"]
+    )
+
+
+    clahe = cv2.createCLAHE(
+        clipLimit=float(
+            TOP_METHOD["clahe_clip_limit"]
+        ),
+        tileGridSize=(
+            tile,
+            tile
+        )
+    )
+
+
+    enhanced = clahe.apply(
+        blurred
+    )
+
+
+    _, bright = cv2.threshold(
+        enhanced,
+        0,
+        255,
+        cv2.THRESH_BINARY
+        +
+        cv2.THRESH_OTSU
+    )
+
+
+    median = float(
+        np.median(
+            enhanced
+        )
+    )
+
+
+    low = int(
+        max(
+            int(TOP_METHOD["canny_min_low"]),
+            float(TOP_METHOD["canny_low_factor"]) * median
+        )
+    )
+
+
+    high = int(
+        min(
+            255,
+            max(
+                low + int(TOP_METHOD["canny_min_gap"]),
+                float(TOP_METHOD["canny_high_factor"]) * median
+            )
+        )
+    )
+
+
+    edges = cv2.Canny(
+        enhanced,
+        low,
+        high
+    )
+
+
+    kernel9_size = int(
+        TOP_METHOD["large_morph_kernel"]
+    )
+
+    if kernel9_size % 2 == 0:
+        kernel9_size += 1
+
+
+    kernel5_size = int(
+        TOP_METHOD["small_morph_kernel"]
+    )
+
+    if kernel5_size % 2 == 0:
+        kernel5_size += 1
+
+
+    kernel9 = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (
+            kernel9_size,
+            kernel9_size
+        )
+    )
+
+
+    kernel5 = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (
+            kernel5_size,
+            kernel5_size
+        )
+    )
+
+
+    bright = cv2.morphologyEx(
+        bright,
+        cv2.MORPH_CLOSE,
+        kernel9,
+        iterations=int(
+            TOP_METHOD["bright_close_iterations"]
+        )
+    )
+
+
+    bright = cv2.morphologyEx(
+        bright,
+        cv2.MORPH_OPEN,
+        kernel5,
+        iterations=int(
+            TOP_METHOD["bright_open_iterations"]
+        )
+    )
+
+
+    edges = cv2.morphologyEx(
+        edges,
+        cv2.MORPH_CLOSE,
+        kernel9,
+        iterations=int(
+            TOP_METHOD["edge_close_iterations"]
+        )
+    )
+
+
+    edges = cv2.dilate(
+        edges,
+        kernel5,
+        iterations=int(
+            TOP_METHOD["edge_dilate_iterations"]
+        )
+    )
+
+
+    contours1, _ = cv2.findContours(
+        bright,
+        cv2.RETR_LIST,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+
+    contours2, _ = cv2.findContours(
+        edges,
+        cv2.RETR_LIST,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+
+    contours = (
+        contours1
+        +
+        contours2
+    )
+
+
+    best = None
+    best_score = -1e30
+
+
+    for contour in contours:
+
+        area = float(
+            cv2.contourArea(
+                contour
+            )
+        )
+
+
+        if area <= 0:
+
+            continue
+
+
+        rect = cv2.minAreaRect(
+            contour
+        )
+
+
+        box = cv2.boxPoints(
+            rect
+        )
+
+
+        box[:, 0] += sx1
+        box[:, 1] += sy1
+
+
+        box = order_points(
+            box
+        )
+
+
+        tl, tr, br, bl = box
+
+
+        top = np.linalg.norm(
+            tr - tl
+        )
+
+
+        bottom = np.linalg.norm(
+            br - bl
+        )
+
+
+        left = np.linalg.norm(
+            bl - tl
+        )
+
+
+        right = np.linalg.norm(
+            br - tr
+        )
+
+
+        width = (
+            top
+            +
+            bottom
+        ) / 2.0
+
+
+        height = (
+            left
+            +
+            right
+        ) / 2.0
+
+
+        if (
+            width < float(TOP_METHOD["min_pixel_side"])
+            or
+            height < float(TOP_METHOD["min_pixel_side"])
+        ):
+
+            continue
+
+
+        long_side = max(
+            width,
+            height
+        )
+
+
+        short_side = min(
+            width,
+            height
+        )
+
+
+        aspect = (
+            long_side
+            /
+            short_side
+        )
+
+
+        if aspect > float(TOP_METHOD["max_aspect"]):
+
+            continue
+
+
+        center = np.mean(
+            box,
+            axis=0
+        )
+
+
+        cx = float(
+            center[0]
+        )
+
+
+        cy = float(
+            center[1]
+        )
+
+
+        dx = (
+            abs(
+                cx
+                -
+                image_cx
+            )
+            /
+            W
+        )
+
+
+        dy = (
+            abs(
+                cy
+                -
+                image_cy
+            )
+            /
+            H
+        )
+
+
+        if dx > TOP_MAX_CENTER_OFFSET_X:
+
+            continue
+
+
+        if dy > TOP_MAX_CENTER_OFFSET_Y:
+
+            continue
+
+
+        size_ratio = 0.5 * (
+
+            width / W
+
+            +
+
+            height / H
+        )
+
+
+        if (
+            size_ratio < TOP_MIN_SIZE_RATIO
+            or
+            size_ratio > TOP_MAX_SIZE_RATIO
+        ):
+
+            continue
+
+
+        center_distance = np.sqrt(
+            dx * dx
+            +
+            dy * dy
+        )
+
+
+        max_distance = np.sqrt(
+
+            TOP_MAX_CENTER_OFFSET_X ** 2
+
+            +
+
+            TOP_MAX_CENTER_OFFSET_Y ** 2
+        )
+
+
+        center_score = (
+
+            1.0
+
+            -
+
+            center_distance
+            /
+            max_distance
+        )
+
+
+        center_score = float(
+            np.clip(
+                center_score,
+                0.0,
+                1.0
+            )
+        )
+
+
+        square_score = (
+            1.0
+            /
+            aspect
+        )
+
+
+        rect_area = (
+            width
+            *
+            height
+        )
+
+
+        fill_score = min(
+
+            area
+            /
+            max(
+                rect_area,
+                1.0
+            ),
+
+            1.0
+        )
+
+
+        size_score = (
+
+            1.0
+
+            -
+
+            abs(
+                size_ratio
+                -
+                TOP_EXPECTED_SIZE_RATIO
+            )
+            /
+            TOP_EXPECTED_SIZE_RATIO
+        )
+
+
+        size_score = float(
+            np.clip(
+                size_score,
+                0.0,
+                1.0
+            )
+        )
+
+
+        score = (
+
+            float(TOP_METHOD["score_center_weight"])
+            *
+            center_score
+
+            +
+
+            float(TOP_METHOD["score_square_weight"])
+            *
+            square_score
+
+            +
+
+            float(TOP_METHOD["score_fill_weight"])
+            *
+            fill_score
+
+            +
+
+            float(TOP_METHOD["score_size_weight"])
+            *
+            size_score
+        )
+
+
+        if score > best_score:
+
+            best_score = score
+
+
+            best = {
+
+                "center":
+                    np.array(
+                        [
+                            cx,
+                            cy
+                        ],
+                        dtype=np.float32
+                    ),
+
+                "box":
+                    box.copy(),
+
+                "width":
+                    float(width),
+
+                "height":
+                    float(height),
+
+                "angle":
+                    rectangle_angle(
+                        box
+                    ),
+
+                "score":
+                    float(score),
+            }
+
+
+    return best
+
+
+# ============================================================
+# BUILD TOP ROTATED SQUARE
+# ============================================================
+
+def build_top_square(detection):
+
+    box = order_points(
+        detection["box"]
+    )
+
+
+    tl, tr, br, bl = box
+
+
+    center = detection[
+        "center"
+    ]
+
+
+    u = (
+
+        (tr - tl)
+
+        +
+
+        (br - bl)
+
+    ) / 2.0
+
+
+    norm = np.linalg.norm(
+        u
+    )
+
+
+    if norm <= 1e-6:
+
+        return None
+
+
+    u = (
+        u / norm
+    )
+
+
+    if u[0] < 0:
+
+        u = -u
+
+
+    v = np.array(
+        [
+            -u[1],
+            u[0]
+        ],
+        dtype=np.float32
+    )
+
+
+    if v[1] < 0:
+
+        v = -v
+
+
+    die_side = max(
+        detection["width"],
+        detection["height"]
+    )
+
+
+    square_side = (
+
+        die_side
+
+        *
+
+        (
+            1.0
+            +
+            2.0
+            *
+            TOP_OFFSET_RATIO
+        )
+    )
+
+
+    half = (
+        square_side
+        /
+        2.0
+    )
+
+
+    tl2 = (
+        center
+        -
+        u * half
+        -
+        v * half
+    )
+
+
+    tr2 = (
+        center
+        +
+        u * half
+        -
+        v * half
+    )
+
+
+    br2 = (
+        center
+        +
+        u * half
+        +
+        v * half
+    )
+
+
+    bl2 = (
+        center
+        -
+        u * half
+        +
+        v * half
+    )
+
+
+    square = np.array(
+        [
+            tl2,
+            tr2,
+            br2,
+            bl2
+        ],
+        dtype=np.float32
+    )
+
+
+    return (
+        square,
+        square_side
+    )
+
+
+# ============================================================
+# CHECK ROTATED SQUARE
+# ============================================================
+
+def square_inside_image(
+    square,
+    image
+):
+
+    H, W = image.shape[:2]
+
+
+    xs = square[:, 0]
+
+    ys = square[:, 1]
+
+
+    return bool(
+
+        np.all(
+            xs >= 0
+        )
+
+        and
+
+        np.all(
+            xs < W
+        )
+
+        and
+
+        np.all(
+            ys >= 0
+        )
+
+        and
+
+        np.all(
+            ys < H
+        )
+    )
+
+
+# ============================================================
+# RECTIFY TOP
+# ============================================================
+
+def rectify_top(
+    original,
+    square,
+    square_side
+):
+
+    source = order_points(
+        square
+    )
+
+
+    native_size = max(
+        int(TOP_METHOD["minimum_native_size"]),
+        int(
+            round(
+                square_side
+            )
+        )
+    )
+
+
+    destination = np.array(
+        [
+            [
+                0,
+                0
+            ],
+
+            [
+                native_size - 1,
+                0
+            ],
+
+            [
+                native_size - 1,
+                native_size - 1
+            ],
+
+            [
+                0,
+                native_size - 1
+            ],
+        ],
+        dtype=np.float32
+    )
+
+
+    transform = cv2.getPerspectiveTransform(
+        source,
+        destination
+    )
+
+
+    crop = cv2.warpPerspective(
+        original,
+        transform,
+        (
+            native_size,
+            native_size
+        ),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE
+    )
+
+
+    return crop
+
+
+# ============================================================
+# TOP DEBUG
+# ============================================================
+
+def make_top_debug(
+    original,
+    square,
+    detection
+):
+
+    g = gray8(
+        original
+    )
+
+
+    debug = cv2.cvtColor(
+        g,
+        cv2.COLOR_GRAY2BGR
+    )
+
+
+    points = np.round(
+        square
+    ).astype(
+        np.int32
+    )
+
+
+    cv2.polylines(
+        debug,
+        [
+            points.reshape(
+                (
+                    -1,
+                    1,
+                    2
+                )
+            )
+        ],
+        True,
+        (
+            0,
+            255,
+            0
+        ),
+        4
+    )
+
+
+    center = tuple(
+        np.round(
+            detection["center"]
+        ).astype(int)
+    )
+
+
+    cv2.circle(
+        debug,
+        center,
+        6,
+        (
+            0,
+            0,
+            255
+        ),
+        -1
+    )
+
+
+    cv2.putText(
+        debug,
+        (
+            f"TOP score="
+            f"{detection['score']:.2f} "
+            f"angle="
+            f"{detection['angle']:.2f}"
+        ),
+        (
+            30,
+            50
+        ),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (
+            0,
+            255,
+            0
+        ),
+        2,
+        cv2.LINE_AA
+    )
+
+
+    return debug
+
+
+# ============================================================
+# PROCESS TOP
+# ============================================================
+
+def process_top(
+    image_path,
+    output_folder,
+    debug_folder,
+    missing_folder,
+    missing_debug_folder
+):
+
+    original = cv2.imread(
+        str(image_path),
+        cv2.IMREAD_UNCHANGED
+    )
+
+
+    if original is None:
+
+        print(
+            f"[TOP ERROR] "
+            f"{image_path.name}"
+        )
+
+        return False
+
+
+    detection = detect_top_die(
+        original
+    )
+
+
+    if detection is None:
+
+        save_missing(
+            image_path,
+            original,
+            missing_folder,
+            missing_debug_folder,
+            "TOP MISSING - NO DIE"
+        )
+
+
+        print(
+            f"[TOP MISSING] "
+            f"{image_path.name} "
+            f"| no die"
+        )
+
+        return False
+
+
+    if (
+        detection["score"]
+        <
+        TOP_MIN_DETECTION_SCORE
+    ):
+
+        save_missing(
+            image_path,
+            original,
+            missing_folder,
+            missing_debug_folder,
+            "TOP MISSING - LOW SCORE"
+        )
+
+
+        return False
+
+
+    if (
+        abs(
+            detection["angle"]
+        )
+        >
+        TOP_MAX_ROTATION_DEG
+    ):
+
+        save_missing(
+            image_path,
+            original,
+            missing_folder,
+            missing_debug_folder,
+            "TOP MISSING - ROTATION"
+        )
+
+
+        return False
+
+
+    result = build_top_square(
+        detection
+    )
+
+
+    if result is None:
+
+        save_missing(
+            image_path,
+            original,
+            missing_folder,
+            missing_debug_folder,
+            "TOP MISSING - GEOMETRY"
+        )
+
+        return False
+
+
+    square, square_side = result
+
+
+    if not square_inside_image(
+        square,
+        original
+    ):
+
+        save_missing(
+            image_path,
+            original,
+            missing_folder,
+            missing_debug_folder,
+            "TOP MISSING - OUTSIDE"
+        )
+
+        return False
+
+
+    debug_folder.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+    debug = make_top_debug(
+        original,
+        square,
+        detection
+    )
+
+
+    cv2.imwrite(
+        str(
+            debug_folder
+            /
+            (
+                image_path.stem
+                +
+                "_debug.png"
+            )
+        ),
+        debug
+    )
+
+
+    crop = rectify_top(
+        original,
+        square,
+        square_side
+    )
+
+
+    final = resize_to_final(
+        crop
+    )
+
+
+    final = lighten_if_dark(
+        final
+    )
+
+
+    output_folder.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+    output_path = (
+        output_folder
+        /
+        image_path.name
+    )
+
+
+    success = cv2.imwrite(
+        str(output_path),
+        final
+    )
+
+
+    if not success:
+
+        return False
+
+
+    print(
+        f"[TOP OK] "
+        f"{image_path.name} "
+        f"| angle="
+        f"{detection['angle']:.2f}° "
+        f"| crop="
+        f"{square_side:.0f}px "
+        f"| {FINAL_SIZE}x{FINAL_SIZE}"
+    )
+
+
+    return True
+
+
+# ============================================================
+# ViBottom METHOD
+# ============================================================
+
+# ============================================================
+# CONTRAST OF BOTTOM CANDIDATE
+# ============================================================
+
+def rectangle_contrast(
+    gray,
+    box
+):
+
+    H, W = gray.shape[:2]
+
+
+    box = np.asarray(
+        box,
+        dtype=np.float32
+    )
+
+
+    center = np.mean(
+        box,
+        axis=0
+    )
+
+
+    inner_mask = np.zeros(
+        (
+            H,
+            W
+        ),
+        dtype=np.uint8
+    )
+
+
+    cv2.fillConvexPoly(
+        inner_mask,
+        np.round(
+            box
+        ).astype(
+            np.int32
+        ),
+        255
+    )
+
+
+    outer_box = (
+
+        center
+
+        +
+
+        float(BOTTOM_METHOD["contrast_outer_scale"])
+        *
+        (
+            box
+            -
+            center
+        )
+    )
+
+
+    outer_mask = np.zeros(
+        (
+            H,
+            W
+        ),
+        dtype=np.uint8
+    )
+
+
+    cv2.fillConvexPoly(
+        outer_mask,
+        np.round(
+            outer_box
+        ).astype(
+            np.int32
+        ),
+        255
+    )
+
+
+    ring_mask = cv2.subtract(
+        outer_mask,
+        inner_mask
+    )
+
+
+    inside = gray[
+        inner_mask > 0
+    ]
+
+
+    outside = gray[
+        ring_mask > 0
+    ]
+
+
+    if (
+        len(inside) == 0
+        or
+        len(outside) == 0
+    ):
+
+        return 0.0
+
+
+    return (
+
+        float(
+            np.mean(
+                inside
+            )
+        )
+
+        -
+
+        float(
+            np.mean(
+                outside
+            )
+        )
+
+    ) / 255.0
+
+
+# ============================================================
+# ROUGH BOTTOM DETECTION
+# ============================================================
+
+def detect_bottom_die(original):
+
+    gray = gray8(
+        original
+    )
+
+
+    H, W = gray.shape[:2]
+
+
+    D = min(
+        H,
+        W
+    )
+
+
+    image_center = np.array(
+        [
+            W / 2.0,
+            H / 2.0
+        ],
+        dtype=np.float32
+    )
+
+
+    sigma = max(
+        float(BOTTOM_METHOD["rough_blur_sigma_min"]),
+        D * float(BOTTOM_METHOD["rough_blur_sigma_ratio"])
+    )
+
+
+    smooth = cv2.GaussianBlur(
+        gray,
+        (
+            0,
+            0
+        ),
+        sigmaX=sigma,
+        sigmaY=sigma
+    )
+
+
+    otsu_value, _ = cv2.threshold(
+        smooth,
+        0,
+        255,
+        cv2.THRESH_BINARY
+        +
+        cv2.THRESH_OTSU
+    )
+
+
+    thresholds = [
+        float(
+            otsu_value
+        )
+    ]
+
+
+    for percentile in BOTTOM_METHOD["threshold_percentiles"]:
+        thresholds.append(
+            float(
+                np.percentile(
+                    smooth,
+                    float(percentile)
+                )
+            )
+        )
+
+
+    close_size = max(
+        int(BOTTOM_METHOD["close_kernel_min"]),
+        int(
+            D * float(BOTTOM_METHOD["close_kernel_ratio"])
+        )
+    )
+
+
+    if close_size % 2 == 0:
+
+        close_size += 1
+
+
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (
+            close_size,
+            close_size
+        )
+    )
+
+
+    candidates = []
+
+
+    for threshold in thresholds:
+
+        _, mask = cv2.threshold(
+            smooth,
+            threshold,
+            255,
+            cv2.THRESH_BINARY
+        )
+
+
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            kernel,
+            iterations=int(
+                BOTTOM_METHOD["close_iterations"]
+            )
+        )
+
+
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+
+        for contour in contours:
+
+            area = float(
+                cv2.contourArea(
+                    contour
+                )
+            )
+
+
+            if area <= 0:
+
+                continue
+
+
+            hull = cv2.convexHull(
+                contour
+            )
+
+
+            rect = cv2.minAreaRect(
+                hull
+            )
+
+
+            (
+                (
+                    cx,
+                    cy
+                ),
+                (
+                    rw,
+                    rh
+                ),
+                _
+            ) = rect
+
+
+            if (
+                rw < float(BOTTOM_METHOD["min_pixel_side"])
+                or
+                rh < float(BOTTOM_METHOD["min_pixel_side"])
+            ):
+
+                continue
+
+
+            long_side = max(
+                rw,
+                rh
+            )
+
+
+            short_side = min(
+                rw,
+                rh
+            )
+
+
+            side_ratio = (
+                long_side
+                /
+                D
+            )
+
+
+            if not (
+                BOTTOM_MIN_SIDE_RATIO
+                <=
+                side_ratio
+                <=
+                BOTTOM_MAX_SIDE_RATIO
+            ):
+
+                continue
+
+
+            aspect = (
+                long_side
+                /
+                max(
+                    short_side,
+                    1.0
+                )
+            )
+
+
+            if aspect > float(BOTTOM_METHOD["max_aspect"]):
+
+                continue
+
+
+            dx = (
+                abs(
+                    cx
+                    -
+                    image_center[0]
+                )
+                /
+                W
+            )
+
+
+            dy = (
+                abs(
+                    cy
+                    -
+                    image_center[1]
+                )
+                /
+                H
+            )
+
+
+            if dx > BOTTOM_MAX_CENTER_OFFSET_X:
+
+                continue
+
+
+            if dy > BOTTOM_MAX_CENTER_OFFSET_Y:
+
+                continue
+
+
+            box = cv2.boxPoints(
+                rect
+            ).astype(
+                np.float32
+            )
+
+
+            contrast = rectangle_contrast(
+                gray,
+                box
+            )
+
+
+            rect_area = (
+                rw
+                *
+                rh
+            )
+
+
+            fill = float(
+                np.clip(
+
+                    area
+                    /
+                    max(
+                        rect_area,
+                        1.0
+                    ),
+
+                    0.0,
+                    1.0
+                )
+            )
+
+
+            square_score = (
+                1.0
+                /
+                aspect
+            )
+
+
+            expected_ratio = float(
+                BOTTOM_METHOD["expected_side_ratio"]
+            )
+
+
+            size_score = (
+
+                1.0
+
+                -
+
+                abs(
+                    side_ratio
+                    -
+                    expected_ratio
+                )
+                /
+                expected_ratio
+            )
+
+
+            size_score = float(
+                np.clip(
+                    size_score,
+                    0.0,
+                    1.0
+                )
+            )
+
+
+            score = (
+
+                float(BOTTOM_METHOD["score_contrast_weight"])
+                *
+                contrast
+
+                +
+
+                float(BOTTOM_METHOD["score_square_weight"])
+                *
+                square_score
+
+                +
+
+                float(BOTTOM_METHOD["score_fill_weight"])
+                *
+                fill
+
+                +
+
+                float(BOTTOM_METHOD["score_size_weight"])
+                *
+                size_score
+            )
+
+
+            candidates.append(
+                {
+
+                    "center":
+                        np.array(
+                            [
+                                cx,
+                                cy
+                            ],
+                            dtype=np.float32
+                        ),
+
+                    "width":
+                        float(
+                            rw
+                        ),
+
+                    "height":
+                        float(
+                            rh
+                        ),
+
+                    "box":
+                        box,
+
+                    "score":
+                        float(
+                            score
+                        ),
+                }
+            )
+
+
+    if not candidates:
+
+        return None
+
+
+    candidates.sort(
+        key=lambda x:
+            x["score"],
+        reverse=True
+    )
+
+
+    return candidates[0]
+
+
+# ============================================================
+# ROTATE BOTTOM
+# ============================================================
+
+def rotate_bottom_image(
+    original,
+    center,
+    angle
+):
+
+    H, W = original.shape[:2]
+
+
+    matrix = cv2.getRotationMatrix2D(
+        (
+            float(
+                center[0]
+            ),
+            float(
+                center[1]
+            )
+        ),
+        angle,
+        1.0
+    )
+
+
+    rotated = cv2.warpAffine(
+        original,
+        matrix,
+        (
+            W,
+            H
+        ),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT_101
+    )
+
+
+    return rotated
+
+
+# ============================================================
+# FIND PROFILE EDGE
+# ============================================================
+
+def find_profile_edge(
+    profile,
+    expected_position,
+    search_radius,
+    positive
+):
+
+    profile = profile.astype(
+        np.float32
+    )
+
+
+    size = max(
+        int(BOTTOM_METHOD["profile_smooth_kernel_min"]),
+        int(
+            len(profile)
+            *
+            float(BOTTOM_METHOD["profile_smooth_kernel_ratio"])
+        )
+    )
+
+
+    if size % 2 == 0:
+
+        size += 1
+
+
+    smooth = cv2.GaussianBlur(
+        profile.reshape(
+            1,
+            -1
+        ),
+        (
+            size,
+            1
+        ),
+        0
+    ).reshape(
+        -1
+    )
+
+
+    gradient = np.gradient(
+        smooth
+    )
+
+
+    low = max(
+        1,
+        int(
+            expected_position
+            -
+            search_radius
+        )
+    )
+
+
+    high = min(
+        len(profile) - 2,
+        int(
+            expected_position
+            +
+            search_radius
+        )
+    )
+
+
+    if high <= low:
+
+        return None
+
+
+    local = gradient[
+        low:
+        high + 1
+    ]
+
+
+    if positive:
+
+        index = (
+
+            low
+
+            +
+
+            int(
+                np.argmax(
+                    local
+                )
+            )
+        )
+
+
+    else:
+
+        index = (
+
+            low
+
+            +
+
+            int(
+                np.argmin(
+                    local
+                )
+            )
+        )
+
+
+    return index
+
+
+# ============================================================
+# REFINE BOTTOM EDGES + RECENTER
+# ============================================================
+
+def refine_bottom_edges(
+    rotated,
+    approx_center,
+    approx_side
+):
+
+    gray = gray8(
+        rotated
+    )
+
+
+    H, W = gray.shape[:2]
+
+
+    cx = float(
+        approx_center[0]
+    )
+
+
+    cy = float(
+        approx_center[1]
+    )
+
+
+    sigma = max(
+        float(BOTTOM_METHOD["refine_blur_sigma_min"]),
+        approx_side * float(BOTTOM_METHOD["refine_blur_sigma_ratio"])
+    )
+
+
+    smooth = cv2.GaussianBlur(
+        gray,
+        (
+            0,
+            0
+        ),
+        sigmaX=sigma,
+        sigmaY=sigma
+    )
+
+
+    band_half = int(
+        approx_side
+        *
+        float(BOTTOM_METHOD["central_band_half_ratio"])
+    )
+
+
+    y1 = max(
+        0,
+        int(
+            cy
+            -
+            band_half
+        )
+    )
+
+
+    y2 = min(
+        H,
+        int(
+            cy
+            +
+            band_half
+        )
+    )
+
+
+    x1 = max(
+        0,
+        int(
+            cx
+            -
+            band_half
+        )
+    )
+
+
+    x2 = min(
+        W,
+        int(
+            cx
+            +
+            band_half
+        )
+    )
+
+
+    if (
+        y2 <= y1
+        or
+        x2 <= x1
+    ):
+
+        return None
+
+
+    x_profile = np.mean(
+        smooth[
+            y1:y2,
+            :
+        ],
+        axis=0
+    )
+
+
+    y_profile = np.mean(
+        smooth[
+            :,
+            x1:x2
+        ],
+        axis=1
+    )
+
+
+    expected_left = (
+        cx
+        -
+        approx_side / 2
+    )
+
+
+    expected_right = (
+        cx
+        +
+        approx_side / 2
+    )
+
+
+    expected_top = (
+        cy
+        -
+        approx_side / 2
+    )
+
+
+    expected_bottom = (
+        cy
+        +
+        approx_side / 2
+    )
+
+
+    search_radius = (
+        approx_side
+        *
+        BOTTOM_EDGE_SEARCH_RATIO
+    )
+
+
+    left = find_profile_edge(
+        x_profile,
+        expected_left,
+        search_radius,
+        positive=True
+    )
+
+
+    right = find_profile_edge(
+        x_profile,
+        expected_right,
+        search_radius,
+        positive=False
+    )
+
+
+    top = find_profile_edge(
+        y_profile,
+        expected_top,
+        search_radius,
+        positive=True
+    )
+
+
+    bottom = find_profile_edge(
+        y_profile,
+        expected_bottom,
+        search_radius,
+        positive=False
+    )
+
+
+    if (
+        left is None
+        or
+        right is None
+        or
+        top is None
+        or
+        bottom is None
+    ):
+
+        return None
+
+
+    span_x = (
+        right
+        -
+        left
+    )
+
+
+    span_y = (
+        bottom
+        -
+        top
+    )
+
+
+    min_span_scale = float(
+        BOTTOM_METHOD["refined_span_min_scale"]
+    )
+
+
+    max_span_scale = float(
+        BOTTOM_METHOD["refined_span_max_scale"]
+    )
+
+
+    if (
+        span_x < approx_side * min_span_scale
+        or
+        span_x > approx_side * max_span_scale
+    ):
+
+        return None
+
+
+    if (
+        span_y < approx_side * min_span_scale
+        or
+        span_y > approx_side * max_span_scale
+    ):
+
+        return None
+
+
+    refined_cx = (
+        left
+        +
+        right
+    ) / 2.0
+
+
+    refined_cy = (
+        top
+        +
+        bottom
+    ) / 2.0
+
+
+    die_side = max(
+        span_x,
+        span_y
+    )
+
+
+    return {
+
+        "center":
+            np.array(
+                [
+                    refined_cx,
+                    refined_cy
+                ],
+                dtype=np.float32
+            ),
+
+        "side":
+            float(
+                die_side
+            ),
+
+        "edges":
+            (
+                int(
+                    left
+                ),
+                int(
+                    top
+                ),
+                int(
+                    right
+                ),
+                int(
+                    bottom
+                )
+            ),
+    }
+
+
+# ============================================================
+# CROP BOTTOM
+# ============================================================
+
+def crop_bottom(
+    rotated,
+    refined
+):
+
+    H, W = rotated.shape[:2]
+
+
+    cx = float(
+        refined["center"][0]
+    )
+
+
+    cy = float(
+        refined["center"][1]
+    )
+
+
+    side = int(
+        round(
+
+            refined["side"]
+
+            *
+
+            (
+                1.0
+                +
+                2.0
+                *
+                BOTTOM_OFFSET_RATIO
+            )
+        )
+    )
+
+
+    x1 = int(
+        round(
+            cx
+            -
+            side / 2
+        )
+    )
+
+
+    y1 = int(
+        round(
+            cy
+            -
+            side / 2
+        )
+    )
+
+
+    x2 = (
+        x1
+        +
+        side
+    )
+
+
+    y2 = (
+        y1
+        +
+        side
+    )
+
+
+    if (
+        x1 < 0
+        or
+        y1 < 0
+        or
+        x2 > W
+        or
+        y2 > H
+    ):
+
+        return (
+            None,
+            None
+        )
+
+
+    crop = rotated[
+        y1:y2,
+        x1:x2
+    ].copy()
+
+
+    return (
+        crop,
+        (
+            x1,
+            y1,
+            x2,
+            y2
+        )
+    )
+
+
+# ============================================================
+# BOTTOM DEBUG
+# ============================================================
+
+def make_bottom_debug(
+    rotated,
+    refined,
+    crop_bbox
+):
+
+    g = gray8(
+        rotated
+    )
+
+
+    debug = cv2.cvtColor(
+        g,
+        cv2.COLOR_GRAY2BGR
+    )
+
+
+    (
+        left,
+        top,
+        right,
+        bottom
+    ) = refined[
+        "edges"
+    ]
+
+
+    cv2.rectangle(
+        debug,
+        (
+            left,
+            top
+        ),
+        (
+            right,
+            bottom
+        ),
+        (
+            0,
+            255,
+            255
+        ),
+        3
+    )
+
+
+    (
+        x1,
+        y1,
+        x2,
+        y2
+    ) = crop_bbox
+
+
+    cv2.rectangle(
+        debug,
+        (
+            x1,
+            y1
+        ),
+        (
+            x2 - 1,
+            y2 - 1
+        ),
+        (
+            0,
+            255,
+            0
+        ),
+        4
+    )
+
+
+    center = tuple(
+        np.round(
+            refined["center"]
+        ).astype(int)
+    )
+
+
+    cv2.circle(
+        debug,
+        center,
+        6,
+        (
+            0,
+            0,
+            255
+        ),
+        -1
+    )
+
+
+    return debug
+
+
+# ============================================================
+# PROCESS BOTTOM
+# ============================================================
+
+def process_bottom(
+    image_path,
+    output_folder,
+    debug_folder,
+    missing_folder,
+    missing_debug_folder
+):
+
+    original = cv2.imread(
+        str(image_path),
+        cv2.IMREAD_UNCHANGED
+    )
+
+
+    if original is None:
+
+        print(
+            f"[BOTTOM ERROR] "
+            f"{image_path.name}"
+        )
+
+        return False
+
+
+    detection = detect_bottom_die(
+        original
+    )
+
+
+    if detection is None:
+
+        save_missing(
+            image_path,
+            original,
+            missing_folder,
+            missing_debug_folder,
+            "BOTTOM MISSING - NO DIE"
+        )
+
+
+        print(
+            f"[BOTTOM MISSING] "
+            f"{image_path.name} "
+            f"| no die"
+        )
+
+        return False
+
+
+    if (
+        detection["score"]
+        <
+        BOTTOM_MIN_DETECTION_SCORE
+    ):
+
+        save_missing(
+            image_path,
+            original,
+            missing_folder,
+            missing_debug_folder,
+            "BOTTOM MISSING - LOW SCORE"
+        )
+
+        return False
+
+
+    angle = rectangle_angle(
+        detection["box"]
+    )
+
+
+    if (
+        abs(angle)
+        >
+        BOTTOM_MAX_ROTATION_DEG
+    ):
+
+        save_missing(
+            image_path,
+            original,
+            missing_folder,
+            missing_debug_folder,
+            "BOTTOM MISSING - ROTATION"
+        )
+
+        return False
+
+
+    rotated = rotate_bottom_image(
+        original,
+        detection["center"],
+        angle
+    )
+
+
+    approx_center = (
+        detection["center"]
+    )
+
+
+    approx_side = max(
+        detection["width"],
+        detection["height"]
+    )
+
+
+    refined = refine_bottom_edges(
+        rotated,
+        approx_center,
+        approx_side
+    )
+
+
+    if refined is None:
+
+        save_missing(
+            image_path,
+            original,
+            missing_folder,
+            missing_debug_folder,
+            "BOTTOM MISSING - EDGE REFINE"
+        )
+
+
+        print(
+            f"[BOTTOM MISSING] "
+            f"{image_path.name} "
+            f"| edge refinement failed"
+        )
+
+        return False
+
+
+    (
+        crop,
+        crop_bbox
+    ) = crop_bottom(
+        rotated,
+        refined
+    )
+
+
+    if crop is None:
+
+        save_missing(
+            image_path,
+            original,
+            missing_folder,
+            missing_debug_folder,
+            "BOTTOM MISSING - OUTSIDE"
+        )
+
+        return False
+
+
+    debug_folder.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+    debug = make_bottom_debug(
+        rotated,
+        refined,
+        crop_bbox
+    )
+
+
+    cv2.imwrite(
+        str(
+            debug_folder
+            /
+            (
+                image_path.stem
+                +
+                "_debug.png"
+            )
+        ),
+        debug
+    )
+
+
+    final = resize_to_final(
+        crop
+    )
+
+
+    final = lighten_if_dark(
+        final
+    )
+
+
+    output_folder.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+    output_path = (
+        output_folder
+        /
+        image_path.name
+    )
+
+
+    success = cv2.imwrite(
+        str(output_path),
+        final
+    )
+
+
+    if not success:
+
+        return False
+
+
+    print(
+        f"[BOTTOM OK] "
+        f"{image_path.name} "
+        f"| angle="
+        f"{angle:.2f}° "
+        f"| die="
+        f"{refined['side']:.0f}px "
+        f"| {FINAL_SIZE}x{FINAL_SIZE}"
+    )
+
+
+    return True
+
+
+# ============================================================
+# PROCESS ONE FOLDER
+# ============================================================
+
+def process_folder(
+    position,
+    label
+):
+
+    input_folder = (
+        INPUT_ROOT
+        /
+        position
+        /
+        label
+    )
+
+
+    output_folder = (
+        OUTPUT_ROOT
+        /
+        position
+        /
+        label
+    )
+
+
+    debug_folder = (
+        OUTPUT_ROOT
+        /
+        OUTPUT_NAMES["debug"]
+        /
+        position
+        /
+        label
+    )
+
+
+    missing_folder = (
+        OUTPUT_ROOT
+        /
+        OUTPUT_NAMES["missing"]
+        /
+        position
+        /
+        label
+    )
+
+
+    missing_debug_folder = (
+        OUTPUT_ROOT
+        /
+        OUTPUT_NAMES["missing_debug"]
+        /
+        position
+        /
+        label
+    )
+
+
+    if not input_folder.exists():
+
+        print(
+            f"[MISSING INPUT] "
+            f"{input_folder}"
+        )
+
+        return
+
+
+    total = 0
+    processed = 0
+    missing = 0
+
+
+    print()
+
+    print(
+        "=" * 80
+    )
+
+
+    print(
+        f"PROCESSING: "
+        f"{position} / {label}"
+    )
+
+
+    print(
+        f"INPUT:  "
+        f"{input_folder}"
+    )
+
+
+    print(
+        f"OUTPUT: "
+        f"{output_folder}"
+    )
+
+
+    print(
+        "=" * 80
+    )
+
+
+    for image_path in sorted(
+        input_folder.iterdir()
+    ):
+
+        if not image_path.is_file():
+
+            continue
+
+
+        if (
+            image_path.suffix.lower()
+            not in IMAGE_EXTENSIONS
+        ):
+
+            continue
+
+
+        total += 1
+
+
+        if position == "ViTop":
+
+            success = process_top(
+
+                image_path,
+
+                output_folder,
+
+                debug_folder,
+
+                missing_folder,
+
+                missing_debug_folder
+            )
+
+
+        elif position == "ViBottom":
+
+            success = process_bottom(
+
+                image_path,
+
+                output_folder,
+
+                debug_folder,
+
+                missing_folder,
+
+                missing_debug_folder
+            )
+
+
+        else:
+
+            print(
+                f"[UNKNOWN DATASET POSITION] {position}"
+            )
+
+            return
+
+
+        if success:
+
+            processed += 1
+
+
+        else:
+
+            missing += 1
+
+
+    print()
+
+    print(
+        f"{position}/{label}: "
+        f"{processed}/{total} processed "
+        f"| Missing={missing}"
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    args = parse_args()
+
+    config, config_dir = load_config(
+        args.config
+    )
+
+    configure(
+        config,
+        config_dir
+    )
+
+
+    print()
+
+    print(
+        "=" * 80
+    )
+
+
+    print(
+        "COMBINED PREPROCESSING"
+    )
+
+    print()
+
+    print(
+        f"CONFIG: {args.config.expanduser().resolve()}"
+    )
+
+    print(
+        f"INPUT ROOT:  {INPUT_ROOT}"
+    )
+
+    print(
+        f"OUTPUT ROOT: {OUTPUT_ROOT}"
+    )
+
+    print()
+
+    print(
+        "ViTop:"
+    )
+
+
+    print(
+        "  rotated central die detection"
+    )
+
+    print()
+
+    print(
+        "ViBottom:"
+    )
+
+
+    print(
+        "  rough detection"
+    )
+
+
+    print(
+        "  small rotation correction"
+    )
+
+
+    print(
+        "  left/right/top/bottom recenter"
+    )
+
+    print()
+
+    print(
+        f"FINAL SIZE = {FINAL_SIZE} x {FINAL_SIZE}"
+    )
+
+
+    print(
+        "NO ECC / NO REFERENCE"
+    )
+
+
+    print(
+        "ORIGINAL DATA = READ ONLY"
+    )
+
+
+    print(
+        "=" * 80
+    )
+
+
+    for (
+        position,
+        label
+    ) in DATASETS:
+
+        process_folder(
+            position,
+            label
+        )
+
+
+    print()
+
+    print(
+        "=" * 80
+    )
+
+
+    print(
+        "DONE"
+    )
+
+    print()
+
+    print(
+        f"Processed:\n"
+        f"{OUTPUT_ROOT}"
+    )
+
+    print()
+
+    print(
+        f"Debug:\n"
+        f"{OUTPUT_ROOT / OUTPUT_NAMES['debug']}"
+    )
+
+    print()
+
+    print(
+        f"Missing:\n"
+        f"{OUTPUT_ROOT / OUTPUT_NAMES['missing']}"
+    )
+
+    print()
+
+    print(
+        "No original image was overwritten, "
+        "moved or deleted."
+    )
+
+
+    print(
+        "=" * 80
+    )
+
+
+if __name__ == "__main__":
+    main()

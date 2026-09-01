@@ -1,0 +1,1091 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Create Good/Bad image folders from a label CSV using an external YAML config.
+
+Pipeline:
+    raw dataset + label CSV
+        -> ViTop/Good
+        -> ViTop/Bad
+        -> ViBottom/Good
+        -> ViBottom/Bad
+
+The Python code contains no project-specific paths.
+All paths, regex patterns, CSV columns, label values and output behaviour
+are controlled from the YAML file.
+
+Run:
+    python classify_good_bad_config.py --config classify_good_bad_config.yaml
+
+Dependencies:
+    pip install pandas pyyaml
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+import shutil
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import pandas as pd
+import yaml
+
+
+# ============================================================
+# CLI / YAML
+# ============================================================
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Create Good/Bad datasets from image files and a label CSV."
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="Path to the YAML config file.",
+    )
+    return parser.parse_args()
+
+
+def load_yaml(path: Path) -> Tuple[dict, Path]:
+    path = path.expanduser().resolve()
+
+    if not path.is_file():
+        raise SystemExit(f"Config file does not exist: {path}")
+
+    with path.open("r", encoding="utf-8") as handle:
+        cfg = yaml.safe_load(handle)
+
+    if not isinstance(cfg, dict):
+        raise SystemExit("YAML top level must be a mapping/dictionary.")
+
+    return cfg, path.parent
+
+
+def resolve_path(value: str, config_dir: Path) -> Path:
+    value = os.path.expandvars(os.path.expanduser(str(value)))
+    path = Path(value)
+
+    if not path.is_absolute():
+        path = config_dir / path
+
+    return path.resolve()
+
+
+def is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+# ============================================================
+# CONFIG VALIDATION
+# ============================================================
+
+def normalise_value(value) -> str:
+    if value is None:
+        return ""
+
+    text = str(value).strip().casefold()
+
+    # Normalise common numeric values read as 0.0 / 1.0.
+    try:
+        number = float(text)
+        if number.is_integer():
+            return str(int(number))
+    except (ValueError, TypeError):
+        pass
+
+    return text
+
+
+def validate_config(raw: dict, config_dir: Path) -> dict:
+    try:
+        paths = raw["paths"]
+
+        dataset_folder = resolve_path(
+            paths["dataset_folder"],
+            config_dir,
+        )
+        csv_file = resolve_path(
+            paths["csv_file"],
+            config_dir,
+        )
+        output_root = resolve_path(
+            paths["output_root"],
+            config_dir,
+        )
+
+        csv_cfg = raw["csv"]
+        unit_id_column = str(csv_cfg["unit_id_column"])
+        csv_encoding = str(csv_cfg.get("encoding", "utf-8-sig"))
+        csv_separator = str(csv_cfg.get("separator", ","))
+
+        image_cfg = raw["images"]
+        recursive = bool(image_cfg.get("recursive", True))
+        extensions = {
+            (
+                str(ext).lower()
+                if str(ext).startswith(".")
+                else "." + str(ext).lower()
+            )
+            for ext in image_cfg["extensions"]
+        }
+
+        class_cfg = raw["classification"]
+        good_values = {
+            normalise_value(v)
+            for v in class_cfg["good_values"]
+        }
+        bad_values = {
+            normalise_value(v)
+            for v in class_cfg["bad_values"]
+        }
+        rule = str(
+            class_cfg.get("rule", "any_bad")
+        ).strip().lower()
+        unknown_policy = str(
+            class_cfg.get("unknown_policy", "skip")
+        ).strip().lower()
+
+        output_cfg = raw.get("output", {})
+        rename_to_unit_id = bool(
+            output_cfg.get("rename_to_unit_id", True)
+        )
+        existing_policy = str(
+            output_cfg.get("existing_files", "error")
+        ).strip().lower()
+        clean_output = bool(
+            output_cfg.get("clean_output_before_run", False)
+        )
+        copy_metadata = bool(
+            output_cfg.get("copy_file_metadata", True)
+        )
+        manifest_name = str(
+            output_cfg.get(
+                "manifest_csv",
+                "classification_manifest.csv",
+            )
+        )
+        unclassified_folder = str(
+            output_cfg.get(
+                "unclassified_folder",
+                "_Unclassified",
+            )
+        )
+
+        datasets_raw = raw["datasets"]
+
+    except KeyError as exc:
+        raise SystemExit(f"Missing YAML setting: {exc}") from exc
+
+    if not dataset_folder.is_dir():
+        raise SystemExit(
+            f"Dataset folder does not exist: {dataset_folder}"
+        )
+
+    if not csv_file.is_file():
+        raise SystemExit(
+            f"CSV file does not exist: {csv_file}"
+        )
+
+    if (
+        output_root == dataset_folder
+        or is_relative_to(output_root, dataset_folder)
+        or is_relative_to(dataset_folder, output_root)
+    ):
+        raise SystemExit(
+            "Safety stop: output_root and dataset_folder must be separate "
+            "directories and neither may contain the other."
+        )
+
+    if not good_values:
+        raise SystemExit(
+            "classification.good_values cannot be empty."
+        )
+
+    if not bad_values:
+        raise SystemExit(
+            "classification.bad_values cannot be empty."
+        )
+
+    overlap = good_values & bad_values
+    if overlap:
+        raise SystemExit(
+            "The same value appears in both good_values and bad_values: "
+            + ", ".join(sorted(overlap))
+        )
+
+    if rule not in {"any_bad", "all_good"}:
+        raise SystemExit(
+            "classification.rule must be 'any_bad' or 'all_good'."
+        )
+
+    if unknown_policy not in {"skip", "unclassified", "error"}:
+        raise SystemExit(
+            "classification.unknown_policy must be "
+            "'skip', 'unclassified', or 'error'."
+        )
+
+    if existing_policy not in {"error", "skip", "overwrite"}:
+        raise SystemExit(
+            "output.existing_files must be "
+            "'error', 'skip', or 'overwrite'."
+        )
+
+    if not manifest_name.lower().endswith(".csv"):
+        raise SystemExit(
+            "output.manifest_csv must end in .csv"
+        )
+
+    if not isinstance(datasets_raw, list) or not datasets_raw:
+        raise SystemExit(
+            "datasets must be a non-empty list."
+        )
+
+    datasets = []
+
+    for item in datasets_raw:
+        if not isinstance(item, dict):
+            raise SystemExit(
+                "Every datasets entry must be a mapping."
+            )
+
+        name = str(item["name"])
+        enabled = bool(item.get("enabled", True))
+
+        regex_pattern = str(item["regex_pattern"])
+        unit_id_regex = str(item["unit_id_regex"])
+
+        match_on = str(
+            item.get("match_on", "filename")
+        ).strip().lower()
+
+        if match_on not in {"filename", "relative_path"}:
+            raise SystemExit(
+                f"{name}: match_on must be filename or relative_path."
+            )
+
+        quality_columns = [
+            str(x)
+            for x in item.get("quality_columns", [])
+        ]
+
+        quality_column_regex = item.get(
+            "quality_column_regex",
+            None,
+        )
+
+        if quality_column_regex is not None:
+            quality_column_regex = str(
+                quality_column_regex
+            )
+
+        if (
+            not quality_columns
+            and not quality_column_regex
+        ):
+            raise SystemExit(
+                f"{name}: provide quality_columns or quality_column_regex."
+            )
+
+        try:
+            image_re = re.compile(
+                regex_pattern,
+                flags=re.IGNORECASE,
+            )
+        except re.error as exc:
+            raise SystemExit(
+                f"{name}: invalid regex_pattern: {exc}"
+            ) from exc
+
+        try:
+            unit_re = re.compile(
+                unit_id_regex,
+                flags=re.IGNORECASE,
+            )
+        except re.error as exc:
+            raise SystemExit(
+                f"{name}: invalid unit_id_regex: {exc}"
+            ) from exc
+
+        quality_re = None
+
+        if quality_column_regex:
+            try:
+                quality_re = re.compile(
+                    quality_column_regex,
+                    flags=re.IGNORECASE,
+                )
+            except re.error as exc:
+                raise SystemExit(
+                    f"{name}: invalid quality_column_regex: {exc}"
+                ) from exc
+
+        datasets.append(
+            {
+                "name": name,
+                "enabled": enabled,
+                "regex_pattern": regex_pattern,
+                "image_re": image_re,
+                "unit_id_regex": unit_id_regex,
+                "unit_re": unit_re,
+                "match_on": match_on,
+                "quality_columns": quality_columns,
+                "quality_re": quality_re,
+            }
+        )
+
+    return {
+        "dataset_folder": dataset_folder,
+        "csv_file": csv_file,
+        "output_root": output_root,
+        "unit_id_column": unit_id_column,
+        "csv_encoding": csv_encoding,
+        "csv_separator": csv_separator,
+        "recursive": recursive,
+        "extensions": extensions,
+        "good_values": good_values,
+        "bad_values": bad_values,
+        "rule": rule,
+        "unknown_policy": unknown_policy,
+        "rename_to_unit_id": rename_to_unit_id,
+        "existing_policy": existing_policy,
+        "clean_output": clean_output,
+        "copy_metadata": copy_metadata,
+        "manifest_name": manifest_name,
+        "unclassified_folder": unclassified_folder,
+        "datasets": datasets,
+    }
+
+
+# ============================================================
+# CSV
+# ============================================================
+
+def load_label_csv(cfg: dict) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(
+            cfg["csv_file"],
+            dtype=str,
+            keep_default_na=False,
+            encoding=cfg["csv_encoding"],
+            sep=cfg["csv_separator"],
+        )
+    except UnicodeDecodeError:
+        # Common fallback for Windows-generated CSV files.
+        df = pd.read_csv(
+            cfg["csv_file"],
+            dtype=str,
+            keep_default_na=False,
+            encoding="cp1252",
+            sep=cfg["csv_separator"],
+        )
+
+    if cfg["unit_id_column"] not in df.columns:
+        raise SystemExit(
+            f"CSV column not found: {cfg['unit_id_column']}\n\n"
+            "Available CSV columns:\n  "
+            + "\n  ".join(map(str, df.columns))
+        )
+
+    df = df.copy()
+
+    df["_unit_id_normalised"] = (
+        df[cfg["unit_id_column"]]
+        .astype(str)
+        .str.strip()
+        .str.casefold()
+    )
+
+    return df
+
+
+def resolve_quality_columns(
+    df: pd.DataFrame,
+    dataset: dict,
+) -> List[str]:
+    explicit = dataset["quality_columns"]
+
+    if explicit:
+        missing = [
+            col
+            for col in explicit
+            if col not in df.columns
+        ]
+
+        if missing:
+            raise SystemExit(
+                f"{dataset['name']}: missing quality column(s):\n  "
+                + "\n  ".join(missing)
+            )
+
+        return explicit
+
+    quality_re = dataset["quality_re"]
+
+    matches = [
+        str(col)
+        for col in df.columns
+        if quality_re.search(str(col))
+    ]
+
+    if not matches:
+        raise SystemExit(
+            f"{dataset['name']}: quality_column_regex matched no CSV columns.\n"
+            f"Regex: {quality_re.pattern}\n\n"
+            "Available CSV columns:\n  "
+            + "\n  ".join(map(str, df.columns))
+        )
+
+    return matches
+
+
+# ============================================================
+# IMAGE DISCOVERY / UNIT ID
+# ============================================================
+
+def enumerate_images(
+    root: Path,
+    extensions: set[str],
+    recursive: bool,
+) -> List[Path]:
+    iterator = root.rglob("*") if recursive else root.glob("*")
+
+    return sorted(
+        [
+            p
+            for p in iterator
+            if p.is_file()
+            and p.suffix.lower() in extensions
+        ],
+        key=lambda p: str(p).lower(),
+    )
+
+
+def image_match_text(
+    image_path: Path,
+    dataset_root: Path,
+    match_on: str,
+) -> str:
+    if match_on == "filename":
+        return image_path.name
+
+    return image_path.relative_to(
+        dataset_root
+    ).as_posix()
+
+
+def extract_unit_id(
+    image_path: Path,
+    dataset_root: Path,
+    dataset: dict,
+) -> Optional[str]:
+    text = image_match_text(
+        image_path,
+        dataset_root,
+        dataset["match_on"],
+    )
+
+    match = dataset["unit_re"].search(text)
+
+    if match is None:
+        return None
+
+    if "unit_id" in match.groupdict():
+        value = match.group("unit_id")
+    elif match.lastindex:
+        value = match.group(1)
+    else:
+        value = match.group(0)
+
+    value = str(value).strip()
+
+    return value or None
+
+
+# ============================================================
+# CLASSIFICATION LOGIC
+# ============================================================
+
+def classify_row(
+    row: pd.Series,
+    quality_columns: Sequence[str],
+    cfg: dict,
+) -> Tuple[Optional[str], str]:
+    values = [
+        normalise_value(row[col])
+        for col in quality_columns
+    ]
+
+    unknown = [
+        value
+        for value in values
+        if value not in cfg["good_values"]
+        and value not in cfg["bad_values"]
+    ]
+
+    if unknown:
+        return (
+            None,
+            "unknown label value(s): "
+            + ", ".join(repr(x) for x in unknown),
+        )
+
+    any_bad = any(
+        value in cfg["bad_values"]
+        for value in values
+    )
+
+    all_good = all(
+        value in cfg["good_values"]
+        for value in values
+    )
+
+    if cfg["rule"] == "any_bad":
+        if any_bad:
+            return "Bad", ""
+        if all_good:
+            return "Good", ""
+
+    elif cfg["rule"] == "all_good":
+        if all_good:
+            return "Good", ""
+        return "Bad", ""
+
+    return None, "could not resolve Good/Bad"
+
+
+def classify_unit_rows(
+    rows: pd.DataFrame,
+    quality_columns: Sequence[str],
+    cfg: dict,
+) -> Tuple[Optional[str], str]:
+    results = []
+
+    for _, row in rows.iterrows():
+        result, reason = classify_row(
+            row,
+            quality_columns,
+            cfg,
+        )
+        results.append((result, reason))
+
+    resolved = {
+        result
+        for result, _ in results
+        if result is not None
+    }
+
+    unresolved_reasons = [
+        reason
+        for result, reason in results
+        if result is None
+    ]
+
+    if unresolved_reasons:
+        return (
+            None,
+            "CSV row contains unresolved labels: "
+            + " | ".join(unresolved_reasons),
+        )
+
+    if len(resolved) == 1:
+        return next(iter(resolved)), ""
+
+    if len(resolved) > 1:
+        return (
+            None,
+            "duplicate CSV rows disagree on Good/Bad",
+        )
+
+    return None, "no class resolved"
+
+
+# ============================================================
+# SAFE COPY
+# ============================================================
+
+def prepare_output(cfg: dict) -> None:
+    root: Path = cfg["output_root"]
+
+    if cfg["clean_output"] and root.exists():
+        print(
+            f"[CLEAN] Removing previous output: {root}"
+        )
+        shutil.rmtree(root)
+
+    if (
+        cfg["existing_policy"] == "error"
+        and root.exists()
+        and any(root.iterdir())
+    ):
+        raise SystemExit(
+            f"Output folder is not empty:\n{root}\n\n"
+            "Use a new folder, or change output.existing_files, "
+            "or enable output.clean_output_before_run."
+        )
+
+    root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+
+def safe_copy(
+    source: Path,
+    destination: Path,
+    cfg: dict,
+) -> str:
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    if destination.exists():
+        if cfg["existing_policy"] == "skip":
+            return "skipped"
+
+        if cfg["existing_policy"] == "error":
+            raise FileExistsError(
+                f"Destination already exists: {destination}"
+            )
+
+    if cfg["copy_metadata"]:
+        shutil.copy2(
+            source,
+            destination,
+        )
+    else:
+        shutil.copyfile(
+            source,
+            destination,
+        )
+
+    return "written"
+
+
+def safe_filename(text: str) -> str:
+    # Windows-forbidden filename characters.
+    text = re.sub(
+        r'[<>:"/\\|?*]',
+        "_",
+        str(text),
+    )
+    return text.strip().rstrip(".")
+
+
+# ============================================================
+# MANIFEST
+# ============================================================
+
+MANIFEST_COLUMNS = [
+    "dataset",
+    "unit_id",
+    "class",
+    "status",
+    "reason",
+    "source_relative_path",
+    "output_relative_path",
+    "quality_columns",
+]
+
+
+def write_manifest(
+    rows: List[dict],
+    output_root: Path,
+    filename: str,
+) -> Path:
+    path = output_root / filename
+
+    with path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=MANIFEST_COLUMNS,
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return path
+
+
+# ============================================================
+# DATASET PROCESSING
+# ============================================================
+
+def handle_unclassified(
+    image_path: Path,
+    dataset: dict,
+    unit_id: str,
+    reason: str,
+    cfg: dict,
+) -> Optional[Path]:
+    policy = cfg["unknown_policy"]
+
+    if policy == "error":
+        raise RuntimeError(
+            f"{dataset['name']} / {image_path.name}: {reason}"
+        )
+
+    if policy == "skip":
+        return None
+
+    destination = (
+        cfg["output_root"]
+        / cfg["unclassified_folder"]
+        / dataset["name"]
+        / image_path.name
+    )
+
+    safe_copy(
+        image_path,
+        destination,
+        cfg,
+    )
+
+    return destination
+
+
+def process_dataset(
+    dataset: dict,
+    all_images: Sequence[Path],
+    df: pd.DataFrame,
+    cfg: dict,
+    manifest_rows: List[dict],
+) -> Dict[str, int]:
+    quality_columns = resolve_quality_columns(
+        df,
+        dataset,
+    )
+
+    matching_images = []
+
+    for image_path in all_images:
+        text = image_match_text(
+            image_path,
+            cfg["dataset_folder"],
+            dataset["match_on"],
+        )
+
+        if dataset["image_re"].search(text):
+            matching_images.append(image_path)
+
+    stats = {
+        "matched": len(matching_images),
+        "good": 0,
+        "bad": 0,
+        "unclassified": 0,
+    }
+
+    print()
+    print("-" * 80)
+    print(f"DATASET: {dataset['name']}")
+    print(
+        "QUALITY COLUMNS: "
+        + ", ".join(quality_columns)
+    )
+    print(
+        f"MATCHED IMAGES: {len(matching_images)}"
+    )
+    print("-" * 80)
+
+    for image_path in matching_images:
+        source_rel = image_path.relative_to(
+            cfg["dataset_folder"]
+        ).as_posix()
+
+        unit_id = extract_unit_id(
+            image_path,
+            cfg["dataset_folder"],
+            dataset,
+        )
+
+        if unit_id is None:
+            reason = (
+                "unit_id_regex did not match image"
+            )
+
+            output_path = handle_unclassified(
+                image_path,
+                dataset,
+                "",
+                reason,
+                cfg,
+            )
+
+            stats["unclassified"] += 1
+
+            manifest_rows.append(
+                {
+                    "dataset": dataset["name"],
+                    "unit_id": "",
+                    "class": "",
+                    "status": "UNCLASSIFIED",
+                    "reason": reason,
+                    "source_relative_path": source_rel,
+                    "output_relative_path": (
+                        ""
+                        if output_path is None
+                        else output_path.relative_to(
+                            cfg["output_root"]
+                        ).as_posix()
+                    ),
+                    "quality_columns": "|".join(
+                        quality_columns
+                    ),
+                }
+            )
+
+            print(
+                f"[UNCLASSIFIED] {image_path.name} | {reason}"
+            )
+            continue
+
+        unit_key = unit_id.strip().casefold()
+
+        csv_rows = df[
+            df["_unit_id_normalised"] == unit_key
+        ]
+
+        if csv_rows.empty:
+            reason = (
+                f"unit id not found in CSV: {unit_id}"
+            )
+
+            output_path = handle_unclassified(
+                image_path,
+                dataset,
+                unit_id,
+                reason,
+                cfg,
+            )
+
+            stats["unclassified"] += 1
+
+            manifest_rows.append(
+                {
+                    "dataset": dataset["name"],
+                    "unit_id": unit_id,
+                    "class": "",
+                    "status": "UNCLASSIFIED",
+                    "reason": reason,
+                    "source_relative_path": source_rel,
+                    "output_relative_path": (
+                        ""
+                        if output_path is None
+                        else output_path.relative_to(
+                            cfg["output_root"]
+                        ).as_posix()
+                    ),
+                    "quality_columns": "|".join(
+                        quality_columns
+                    ),
+                }
+            )
+
+            print(
+                f"[UNCLASSIFIED] {image_path.name} | {reason}"
+            )
+            continue
+
+        class_name, reason = classify_unit_rows(
+            csv_rows,
+            quality_columns,
+            cfg,
+        )
+
+        if class_name is None:
+            output_path = handle_unclassified(
+                image_path,
+                dataset,
+                unit_id,
+                reason,
+                cfg,
+            )
+
+            stats["unclassified"] += 1
+
+            manifest_rows.append(
+                {
+                    "dataset": dataset["name"],
+                    "unit_id": unit_id,
+                    "class": "",
+                    "status": "UNCLASSIFIED",
+                    "reason": reason,
+                    "source_relative_path": source_rel,
+                    "output_relative_path": (
+                        ""
+                        if output_path is None
+                        else output_path.relative_to(
+                            cfg["output_root"]
+                        ).as_posix()
+                    ),
+                    "quality_columns": "|".join(
+                        quality_columns
+                    ),
+                }
+            )
+
+            print(
+                f"[UNCLASSIFIED] {image_path.name} | {reason}"
+            )
+            continue
+
+        if cfg["rename_to_unit_id"]:
+            destination_name = (
+                safe_filename(unit_id)
+                + image_path.suffix.lower()
+            )
+        else:
+            destination_name = image_path.name
+
+        destination = (
+            cfg["output_root"]
+            / dataset["name"]
+            / class_name
+            / destination_name
+        )
+
+        safe_copy(
+            image_path,
+            destination,
+            cfg,
+        )
+
+        stats[class_name.lower()] += 1
+
+        manifest_rows.append(
+            {
+                "dataset": dataset["name"],
+                "unit_id": unit_id,
+                "class": class_name,
+                "status": "OK",
+                "reason": "",
+                "source_relative_path": source_rel,
+                "output_relative_path": destination.relative_to(
+                    cfg["output_root"]
+                ).as_posix(),
+                "quality_columns": "|".join(
+                    quality_columns
+                ),
+            }
+        )
+
+        print(
+            f"[{class_name.upper()}] "
+            f"{image_path.name} -> "
+            f"{dataset['name']}/{class_name}/{destination_name}"
+        )
+
+    return stats
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> None:
+    args = parse_args()
+
+    raw_cfg, config_dir = load_yaml(
+        args.config
+    )
+
+    cfg = validate_config(
+        raw_cfg,
+        config_dir,
+    )
+
+    prepare_output(cfg)
+
+    df = load_label_csv(cfg)
+
+    all_images = enumerate_images(
+        cfg["dataset_folder"],
+        cfg["extensions"],
+        cfg["recursive"],
+    )
+
+    print()
+    print("=" * 80)
+    print("GOOD / BAD DATASET CREATION")
+    print("=" * 80)
+    print(f"CONFIG:         {args.config.expanduser().resolve()}")
+    print(f"DATASET FOLDER: {cfg['dataset_folder']}")
+    print(f"LABEL CSV:      {cfg['csv_file']}")
+    print(f"OUTPUT ROOT:    {cfg['output_root']}")
+    print(f"UNIT ID COLUMN: {cfg['unit_id_column']}")
+    print(f"IMAGES FOUND:   {len(all_images)}")
+    print()
+    print(
+        "GOOD VALUES: "
+        + ", ".join(sorted(cfg["good_values"]))
+    )
+    print(
+        "BAD VALUES:  "
+        + ", ".join(sorted(cfg["bad_values"]))
+    )
+    print(f"RULE:           {cfg['rule']}")
+    print("ORIGINAL IMAGES: READ ONLY / COPIED")
+    print("=" * 80)
+
+    manifest_rows: List[dict] = []
+
+    totals = {
+        "matched": 0,
+        "good": 0,
+        "bad": 0,
+        "unclassified": 0,
+    }
+
+    for dataset in cfg["datasets"]:
+        if not dataset["enabled"]:
+            continue
+
+        stats = process_dataset(
+            dataset,
+            all_images,
+            df,
+            cfg,
+            manifest_rows,
+        )
+
+        for key in totals:
+            totals[key] += stats[key]
+
+    manifest_path = write_manifest(
+        manifest_rows,
+        cfg["output_root"],
+        cfg["manifest_name"],
+    )
+
+    print()
+    print("=" * 80)
+    print("DONE")
+    print(f"Matched images: {totals['matched']}")
+    print(f"Good:           {totals['good']}")
+    print(f"Bad:            {totals['bad']}")
+    print(f"Unclassified:   {totals['unclassified']}")
+    print(f"Manifest:       {manifest_path}")
+    print(f"Output:         {cfg['output_root']}")
+    print()
+    print(
+        "No original image was moved, deleted or overwritten."
+    )
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    main()

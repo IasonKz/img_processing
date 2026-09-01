@@ -1,0 +1,159 @@
+# ============================================================
+# GOOD / BAD CLASSIFICATION CONFIG
+# ============================================================
+
+paths:
+
+  # Current raw dataset shown in your old config
+  dataset_folder: "C:/Users/lana/OneDrive - NIL Technology/Desktop/Classification Demo/C00000025"
+
+  # IMPORTANT:
+  # In your screenshot this path continues with "EvaluationR..."
+  # Put the EXACT CSV filename here.
+  csv_file: "C:/Users/lana/OneDrive - NIL Technology/Desktop/Classification Demo/C00000025/EvaluationResults.csv"
+
+  # Output used by the next preprocessing step
+  output_root: "C:/Users/laka/software/classification_laka"
+
+
+# ============================================================
+# CSV
+# ============================================================
+
+csv:
+
+  # Change ONLY if your CSV uses another exact column name
+  # for C00000084_Rc03Cc10 etc.
+  unit_id_column: "UnitIdentifier"
+
+  encoding: "utf-8-sig"
+  separator: ","
+
+
+# ============================================================
+# GOOD / BAD LABEL INTERPRETATION
+# ============================================================
+
+classification:
+
+  good_values:
+    - 0
+    - "Good"
+    - "Pass"
+    - "OK"
+
+  bad_values:
+    - 1
+    - "Bad"
+    - "Fail"
+    - "NOK"
+
+  # If any relevant label is Bad -> image = Bad
+  # All labels must be Good -> image = Good
+  rule: "any_bad"
+
+  # Images that cannot be classified are kept separately
+  unknown_policy: "unclassified"
+
+
+# ============================================================
+# DATASETS
+# ============================================================
+
+datasets:
+
+  # ----------------------------------------------------------
+  # ViTop
+  # ----------------------------------------------------------
+
+  - name: "ViTop"
+    enabled: true
+
+    regex_pattern: '.*_ViTop(?:Final|PostTarget)_.*\.(bmp|png|jpg|jpeg|tif|tiff)$'
+
+    unit_id_regex: '^(?P<unit_id>.+?)_ViTop'
+
+    match_on: "filename"
+
+    quality_columns:
+      - "Quality_VI_Top_Inner_Label"
+      - "Quality_VI_Top_Outer_Label"
+
+    quality_column_regex: '(?i)^Quality_VI_Top_.*_Label$'
+
+
+  # ----------------------------------------------------------
+  # ViBottom
+  # ----------------------------------------------------------
+
+  - name: "ViBottom"
+    enabled: true
+
+    regex_pattern: '.*_ViBottom(?:Final|PostTarget)_.*\.(bmp|png|jpg|jpeg|tif|tiff)$'
+
+    unit_id_regex: '^(?P<unit_id>.+?)_ViBottom'
+
+    match_on: "filename"
+
+    # Automatically detect Bottom quality columns
+    quality_columns: []
+
+    quality_column_regex: '(?i)^Quality_VI_(?:Bot|Bottom)_.*_Label$'
+
+
+  # ----------------------------------------------------------
+  # VIGNETTING - DISABLED FOR NOW
+  # ----------------------------------------------------------
+
+  - name: "Vignetting"
+    enabled: false
+
+    regex_pattern: '.*_FlatFieldBright_.*\.(bmp|png|jpg|jpeg|tif|tiff)$'
+
+    unit_id_regex: '^(?P<unit_id>.+?)_FlatFieldBright'
+
+    match_on: "filename"
+
+    quality_columns:
+      - "Quality_VI_Vig_Particles_Label"
+      - "Quality_VI_Vig_PnP_Label"
+      - "Quality_VI_Vig_Wave_Label"
+      - "Quality_VI_Vig_Others_Label"
+
+    quality_column_regex: '(?i)^Quality_VI_Vig_.*_Label$'
+
+
+# ============================================================
+# IMAGE SEARCH
+# ============================================================
+
+images:
+
+  recursive: true
+
+  extensions:
+    - ".bmp"
+    - ".png"
+    - ".jpg"
+    - ".jpeg"
+    - ".tif"
+    - ".tiff"
+
+
+# ============================================================
+# OUTPUT
+# ============================================================
+
+output:
+
+  rename_to_unit_id: true
+
+  clean_output_before_run: false
+
+  existing_files: "error"
+
+  copy_file_metadata: true
+
+  manifest_csv: "classification_manifest.csv"
+
+  unclassified_folder: "_Unclassified"

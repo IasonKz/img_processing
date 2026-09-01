@@ -1,0 +1,159 @@
+from pathlib import Path
+import random
+import shutil
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+TRAY_FOLDERS = {
+    "tray1": Path(r"C:\path\to\tray1"),
+    "tray2": Path(r"C:\path\to\tray2"),
+    "tray3": Path(r"C:\path\to\tray3"),
+}
+
+OUTPUT_DIR = Path(r"C:\path\to\output_dataset")
+
+N_PER_TRAY = 100
+
+TRAIN_RATIO = 0.70
+VAL_RATIO = 0.15
+TEST_RATIO = 0.15
+
+RANDOM_SEED = 42
+
+IMAGE_EXTENSIONS = {
+    ".bmp",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tif",
+    ".tiff",
+}
+
+
+# ============================================================
+# FUNCTIONS
+# ============================================================
+
+def get_images(folder):
+    """Return all images inside folder."""
+    return [
+        p for p in folder.iterdir()
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+
+
+def split_images(images):
+    """
+    Randomly split images into train / val / test.
+    """
+
+    images = images.copy()
+    random.shuffle(images)
+
+    n = len(images)
+
+    n_train = int(n * TRAIN_RATIO)
+    n_val = int(n * VAL_RATIO)
+
+    train = images[:n_train]
+    val = images[n_train:n_train + n_val]
+    test = images[n_train + n_val:]
+
+    return train, val, test
+
+
+def copy_images(images, destination, tray_name):
+    """
+    Copy images to destination.
+
+    tray_name is added to filename to avoid collisions
+    between different trays.
+    """
+
+    destination.mkdir(parents=True, exist_ok=True)
+
+    for image in images:
+
+        new_name = f"{tray_name}_{image.name}"
+
+        shutil.copy2(
+            image,
+            destination / new_name
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    random.seed(RANDOM_SEED)
+
+    for tray_name, tray_folder in TRAY_FOLDERS.items():
+
+        print(f"\nProcessing {tray_name}")
+        print(f"Folder: {tray_folder}")
+
+        images = get_images(tray_folder)
+
+        print(f"Found {len(images)} images")
+
+        if len(images) < N_PER_TRAY:
+            raise ValueError(
+                f"{tray_name} contains only {len(images)} images. "
+                f"Need at least {N_PER_TRAY}."
+            )
+
+        # ----------------------------------------------------
+        # Randomly choose exactly 100 images
+        # ----------------------------------------------------
+
+        selected = random.sample(
+            images,
+            N_PER_TRAY
+        )
+
+        # ----------------------------------------------------
+        # Split selected images
+        # ----------------------------------------------------
+
+        train, val, test = split_images(selected)
+
+        print(
+            f"Selected: {len(selected)} | "
+            f"Train: {len(train)} | "
+            f"Val: {len(val)} | "
+            f"Test: {len(test)}"
+        )
+
+        # ----------------------------------------------------
+        # Copy
+        # ----------------------------------------------------
+
+        copy_images(
+            train,
+            OUTPUT_DIR / "train",
+            tray_name
+        )
+
+        copy_images(
+            val,
+            OUTPUT_DIR / "val",
+            tray_name
+        )
+
+        copy_images(
+            test,
+            OUTPUT_DIR / "test",
+            tray_name
+        )
+
+    print("\nDONE")
+    print(f"Dataset saved to: {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()

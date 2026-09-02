@@ -1,0 +1,1283 @@
+from pathlib import Path
+import argparse
+import copy
+import csv
+import json
+import random
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+from torchvision import models, transforms
+
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    precision_recall_fscore_support,
+)
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+IMAGE_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".bmp",
+    ".tif",
+    ".tiff",
+}
+
+
+# ============================================================
+# REPRODUCIBILITY
+# ============================================================
+
+def set_seed(seed=42):
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+# ============================================================
+# CUSTOM DATASET
+#
+# Expected structure:
+#
+# dataset/
+# ├── good/
+# │   ├── train/
+# │   ├── validation/
+# │   └── test/
+# │
+# └── bad/
+#     ├── train/
+#     ├── validation/
+#     └── test/
+#
+# ============================================================
+
+class BinaryImageDataset(Dataset):
+
+    def __init__(
+        self,
+        root_dir,
+        split,
+        transform=None,
+    ):
+
+        self.root_dir = Path(root_dir)
+        self.split = split
+        self.transform = transform
+
+        # Fixed labels
+        #
+        # bad  = 0
+        # good = 1
+
+        self.class_to_idx = {
+            "bad": 0,
+            "good": 1,
+        }
+
+        self.classes = [
+            "bad",
+            "good",
+        ]
+
+        self.samples = []
+
+        for class_name in self.classes:
+
+            folder = (
+                self.root_dir
+                / class_name
+                / split
+            )
+
+            if not folder.exists():
+
+                raise FileNotFoundError(
+                    f"Folder not found:\n{folder}"
+                )
+
+            image_paths = sorted(
+                [
+                    path
+                    for path in folder.rglob("*")
+                    if (
+                        path.is_file()
+                        and path.suffix.lower()
+                        in IMAGE_EXTENSIONS
+                    )
+                ]
+            )
+
+            label = self.class_to_idx[
+                class_name
+            ]
+
+            for image_path in image_paths:
+
+                self.samples.append(
+                    (
+                        image_path,
+                        label,
+                    )
+                )
+
+        if len(self.samples) == 0:
+
+            raise RuntimeError(
+                f"No images found for split: {split}"
+            )
+
+    def __len__(self):
+
+        return len(self.samples)
+
+    def __getitem__(self, index):
+
+        image_path, label = self.samples[
+            index
+        ]
+
+        image = Image.open(
+            image_path
+        ).convert("RGB")
+
+        if self.transform is not None:
+
+            image = self.transform(
+                image
+            )
+
+        return (
+            image,
+            label,
+            str(image_path),
+        )
+
+
+# ============================================================
+# PRINT DATASET INFORMATION
+# ============================================================
+
+def print_dataset_info(
+    name,
+    dataset,
+):
+
+    counts = {
+        "bad": 0,
+        "good": 0,
+    }
+
+    for _, label in dataset.samples:
+
+        class_name = dataset.classes[
+            label
+        ]
+
+        counts[class_name] += 1
+
+    print("\n")
+    print("=" * 60)
+    print(name)
+    print("=" * 60)
+
+    print(
+        f"Total images: "
+        f"{len(dataset)}"
+    )
+
+    print(
+        f"Bad images: "
+        f"{counts['bad']}"
+    )
+
+    print(
+        f"Good images: "
+        f"{counts['good']}"
+    )
+
+
+# ============================================================
+# TRAIN ONE EPOCH
+# ============================================================
+
+def train_one_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    device,
+):
+
+    model.train()
+
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    for (
+        images,
+        labels,
+        _,
+    ) in loader:
+
+        images = images.to(
+            device
+        )
+
+        labels = labels.to(
+            device
+        )
+
+        optimizer.zero_grad()
+
+        outputs = model(
+            images
+        )
+
+        loss = criterion(
+            outputs,
+            labels
+        )
+
+        loss.backward()
+
+        optimizer.step()
+
+        predictions = torch.argmax(
+            outputs,
+            dim=1,
+        )
+
+        running_loss += (
+            loss.item()
+            * images.size(0)
+        )
+
+        correct += (
+            predictions
+            == labels
+        ).sum().item()
+
+        total += labels.size(0)
+
+    epoch_loss = (
+        running_loss
+        / total
+    )
+
+    epoch_accuracy = (
+        correct
+        / total
+    )
+
+    return (
+        epoch_loss,
+        epoch_accuracy,
+    )
+
+
+# ============================================================
+# VALIDATE
+# ============================================================
+
+def validate(
+    model,
+    loader,
+    criterion,
+    device,
+):
+
+    model.eval()
+
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+
+        for (
+            images,
+            labels,
+            _,
+        ) in loader:
+
+            images = images.to(
+                device
+            )
+
+            labels = labels.to(
+                device
+            )
+
+            outputs = model(
+                images
+            )
+
+            loss = criterion(
+                outputs,
+                labels
+            )
+
+            predictions = torch.argmax(
+                outputs,
+                dim=1,
+            )
+
+            running_loss += (
+                loss.item()
+                * images.size(0)
+            )
+
+            correct += (
+                predictions
+                == labels
+            ).sum().item()
+
+            total += labels.size(0)
+
+    epoch_loss = (
+        running_loss
+        / total
+    )
+
+    epoch_accuracy = (
+        correct
+        / total
+    )
+
+    return (
+        epoch_loss,
+        epoch_accuracy,
+    )
+
+
+# ============================================================
+# TRAIN MODEL
+# ============================================================
+
+def train_model(
+    model,
+    train_loader,
+    validation_loader,
+    criterion,
+    optimizer,
+    device,
+    epochs,
+    output_dir,
+):
+
+    best_weights = copy.deepcopy(
+        model.state_dict()
+    )
+
+    best_validation_accuracy = 0.0
+
+    history = []
+
+    for epoch in range(epochs):
+
+        print("\n")
+        print(
+            f"Epoch "
+            f"{epoch + 1}/{epochs}"
+        )
+
+        print("-" * 60)
+
+        # TRAIN
+
+        (
+            train_loss,
+            train_accuracy,
+        ) = train_one_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+        )
+
+        # VALIDATION
+
+        (
+            validation_loss,
+            validation_accuracy,
+        ) = validate(
+            model,
+            validation_loader,
+            criterion,
+            device,
+        )
+
+        print(
+            f"Train loss: "
+            f"{train_loss:.4f}"
+        )
+
+        print(
+            f"Train accuracy: "
+            f"{train_accuracy * 100:.2f}%"
+        )
+
+        print(
+            f"Validation loss: "
+            f"{validation_loss:.4f}"
+        )
+
+        print(
+            f"Validation accuracy: "
+            f"{validation_accuracy * 100:.2f}%"
+        )
+
+        history.append(
+            {
+                "epoch": epoch + 1,
+
+                "train_loss":
+                    train_loss,
+
+                "train_accuracy":
+                    train_accuracy,
+
+                "validation_loss":
+                    validation_loss,
+
+                "validation_accuracy":
+                    validation_accuracy,
+            }
+        )
+
+        # SAVE BEST MODEL
+
+        if (
+            validation_accuracy
+            > best_validation_accuracy
+        ):
+
+            best_validation_accuracy = (
+                validation_accuracy
+            )
+
+            best_weights = copy.deepcopy(
+                model.state_dict()
+            )
+
+            torch.save(
+                best_weights,
+                output_dir
+                / "best_model.pth",
+            )
+
+            print(
+                "\n>>> Best model saved"
+            )
+
+            print(
+                f">>> Validation accuracy: "
+                f"{validation_accuracy * 100:.2f}%"
+            )
+
+    # Restore best model
+
+    model.load_state_dict(
+        best_weights
+    )
+
+    # Save history
+
+    history_path = (
+        output_dir
+        / "training_history.csv"
+    )
+
+    with open(
+        history_path,
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=[
+                "epoch",
+                "train_loss",
+                "train_accuracy",
+                "validation_loss",
+                "validation_accuracy",
+            ],
+        )
+
+        writer.writeheader()
+        writer.writerows(
+            history
+        )
+
+    return model
+
+
+# ============================================================
+# TEST MODEL
+# ============================================================
+
+def test_model(
+    model,
+    test_loader,
+    device,
+    output_dir,
+):
+
+    model.eval()
+
+    actual_labels = []
+    predicted_labels = []
+
+    prediction_rows = []
+
+    with torch.no_grad():
+
+        for (
+            images,
+            labels,
+            paths,
+        ) in test_loader:
+
+            images = images.to(
+                device
+            )
+
+            outputs = model(
+                images
+            )
+
+            probabilities = torch.softmax(
+                outputs,
+                dim=1,
+            )
+
+            predictions = torch.argmax(
+                probabilities,
+                dim=1,
+            )
+
+            probabilities = (
+                probabilities
+                .cpu()
+                .numpy()
+            )
+
+            predictions = (
+                predictions
+                .cpu()
+                .numpy()
+            )
+
+            labels = (
+                labels
+                .cpu()
+                .numpy()
+            )
+
+            for i in range(
+                len(labels)
+            ):
+
+                actual_index = int(
+                    labels[i]
+                )
+
+                predicted_index = int(
+                    predictions[i]
+                )
+
+                actual_name = (
+                    "bad"
+                    if actual_index == 0
+                    else "good"
+                )
+
+                predicted_name = (
+                    "bad"
+                    if predicted_index == 0
+                    else "good"
+                )
+
+                probability_bad = float(
+                    probabilities[i][0]
+                )
+
+                probability_good = float(
+                    probabilities[i][1]
+                )
+
+                prediction_rows.append(
+                    {
+                        "image_name":
+                            Path(
+                                paths[i]
+                            ).name,
+
+                        "image_path":
+                            paths[i],
+
+                        "actual_label":
+                            actual_name,
+
+                        "predicted_label":
+                            predicted_name,
+
+                        "correct":
+                            actual_name
+                            == predicted_name,
+
+                        "probability_bad":
+                            probability_bad,
+
+                        "probability_good":
+                            probability_good,
+                    }
+                )
+
+            actual_labels.extend(
+                labels
+            )
+
+            predicted_labels.extend(
+                predictions
+            )
+
+    # ========================================================
+    # METRICS
+    # ========================================================
+
+    accuracy = accuracy_score(
+        actual_labels,
+        predicted_labels,
+    )
+
+    matrix = confusion_matrix(
+        actual_labels,
+        predicted_labels,
+        labels=[
+            0,
+            1,
+        ],
+    )
+
+    (
+        precision,
+        recall,
+        f1,
+        support,
+    ) = precision_recall_fscore_support(
+        actual_labels,
+        predicted_labels,
+        labels=[
+            0,
+            1,
+        ],
+        zero_division=0,
+    )
+
+    # ========================================================
+    # PRINT RESULTS
+    # ========================================================
+
+    print("\n")
+    print("=" * 70)
+    print("FINAL TEST RESULTS")
+    print("=" * 70)
+
+    print(
+        f"\nAccuracy: "
+        f"{accuracy * 100:.2f}%"
+    )
+
+    print(
+        "\nClassification report:"
+    )
+
+    print(
+        classification_report(
+            actual_labels,
+            predicted_labels,
+            labels=[
+                0,
+                1,
+            ],
+            target_names=[
+                "bad",
+                "good",
+            ],
+            digits=4,
+            zero_division=0,
+        )
+    )
+
+    print(
+        "\nConfusion matrix:"
+    )
+
+    print(
+        "\n                Predicted"
+    )
+
+    print(
+        "               BAD    GOOD"
+    )
+
+    print(
+        f"Actual BAD     "
+        f"{matrix[0][0]:4d}    "
+        f"{matrix[0][1]:4d}"
+    )
+
+    print(
+        f"Actual GOOD    "
+        f"{matrix[1][0]:4d}    "
+        f"{matrix[1][1]:4d}"
+    )
+
+    # ========================================================
+    # SAVE EACH IMAGE PREDICTION
+    # ========================================================
+
+    predictions_path = (
+        output_dir
+        / "test_predictions.csv"
+    )
+
+    with open(
+        predictions_path,
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=[
+                "image_name",
+                "image_path",
+                "actual_label",
+                "predicted_label",
+                "correct",
+                "probability_bad",
+                "probability_good",
+            ],
+        )
+
+        writer.writeheader()
+
+        writer.writerows(
+            prediction_rows
+        )
+
+    # ========================================================
+    # SAVE METRICS JSON
+    # ========================================================
+
+    results = {
+
+        "accuracy": float(
+            accuracy
+        ),
+
+        "accuracy_percent": float(
+            accuracy * 100
+        ),
+
+        "bad": {
+
+            "precision":
+                float(
+                    precision[0]
+                ),
+
+            "recall":
+                float(
+                    recall[0]
+                ),
+
+            "f1_score":
+                float(
+                    f1[0]
+                ),
+
+            "number_of_images":
+                int(
+                    support[0]
+                ),
+        },
+
+        "good": {
+
+            "precision":
+                float(
+                    precision[1]
+                ),
+
+            "recall":
+                float(
+                    recall[1]
+                ),
+
+            "f1_score":
+                float(
+                    f1[1]
+                ),
+
+            "number_of_images":
+                int(
+                    support[1]
+                ),
+        },
+
+        "confusion_matrix": {
+
+            "actual_bad_predicted_bad":
+                int(
+                    matrix[0][0]
+                ),
+
+            "actual_bad_predicted_good":
+                int(
+                    matrix[0][1]
+                ),
+
+            "actual_good_predicted_bad":
+                int(
+                    matrix[1][0]
+                ),
+
+            "actual_good_predicted_good":
+                int(
+                    matrix[1][1]
+                ),
+        },
+    }
+
+    metrics_path = (
+        output_dir
+        / "test_metrics.json"
+    )
+
+    with open(
+        metrics_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        json.dump(
+            results,
+            file,
+            indent=4,
+        )
+
+    # ========================================================
+    # SAVE WRONG PREDICTIONS ONLY
+    # ========================================================
+
+    wrong_predictions = [
+        row
+        for row in prediction_rows
+        if not row["correct"]
+    ]
+
+    wrong_path = (
+        output_dir
+        / "wrong_predictions.csv"
+    )
+
+    with open(
+        wrong_path,
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=[
+                "image_name",
+                "image_path",
+                "actual_label",
+                "predicted_label",
+                "correct",
+                "probability_bad",
+                "probability_good",
+            ],
+        )
+
+        writer.writeheader()
+
+        writer.writerows(
+            wrong_predictions
+        )
+
+    print("\nFiles saved:")
+    print(
+        predictions_path
+    )
+    print(
+        metrics_path
+    )
+    print(
+        wrong_path
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--data",
+        required=True,
+        help=(
+            "Root folder containing "
+            "good/ and bad/"
+        ),
+    )
+
+    parser.add_argument(
+        "--output",
+        default="model_output",
+    )
+
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=15,
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+    )
+
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=1e-4,
+    )
+
+    args = parser.parse_args()
+
+    set_seed(42)
+
+    # ========================================================
+    # PATHS
+    # ========================================================
+
+    data_root = Path(
+        args.data
+    )
+
+    output_dir = Path(
+        args.output
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # ========================================================
+    # DEVICE
+    # ========================================================
+
+    if torch.cuda.is_available():
+
+        device = torch.device(
+            "cuda"
+        )
+
+        print(
+            "\nUsing GPU:"
+        )
+
+        print(
+            torch.cuda.get_device_name(
+                0
+            )
+        )
+
+    else:
+
+        device = torch.device(
+            "cpu"
+        )
+
+        print(
+            "\nUsing CPU"
+        )
+
+    # ========================================================
+    # TRANSFORMS
+    #
+    # NO RESIZE.
+    #
+    # Assumes images are already approximately 600x600.
+    #
+    # ========================================================
+
+    train_transform = transforms.Compose(
+        [
+
+            transforms.RandomApply(
+                [
+                    transforms.ColorJitter(
+                        brightness=0.10,
+                        contrast=0.10,
+                    )
+                ],
+                p=0.4,
+            ),
+
+            transforms.RandomRotation(
+                degrees=3,
+                fill=0,
+            ),
+
+            transforms.ToTensor(),
+
+            transforms.Normalize(
+                mean=[
+                    0.485,
+                    0.456,
+                    0.406,
+                ],
+                std=[
+                    0.229,
+                    0.224,
+                    0.225,
+                ],
+            ),
+        ]
+    )
+
+    evaluation_transform = (
+        transforms.Compose(
+            [
+
+                transforms.ToTensor(),
+
+                transforms.Normalize(
+                    mean=[
+                        0.485,
+                        0.456,
+                        0.406,
+                    ],
+                    std=[
+                        0.229,
+                        0.224,
+                        0.225,
+                    ],
+                ),
+            ]
+        )
+    )
+
+    # ========================================================
+    # DATASETS
+    # ========================================================
+
+    train_dataset = (
+        BinaryImageDataset(
+            root_dir=data_root,
+            split="train",
+            transform=train_transform,
+        )
+    )
+
+    validation_dataset = (
+        BinaryImageDataset(
+            root_dir=data_root,
+            split="validation",
+            transform=evaluation_transform,
+        )
+    )
+
+    test_dataset = (
+        BinaryImageDataset(
+            root_dir=data_root,
+            split="test",
+            transform=evaluation_transform,
+        )
+    )
+
+    print_dataset_info(
+        "TRAIN",
+        train_dataset,
+    )
+
+    print_dataset_info(
+        "VALIDATION",
+        validation_dataset,
+    )
+
+    print_dataset_info(
+        "TEST",
+        test_dataset,
+    )
+
+    # ========================================================
+    # DATALOADERS
+    # ========================================================
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    # ========================================================
+    # MODEL
+    # ========================================================
+
+    weights = (
+        models.ResNet18_Weights.DEFAULT
+    )
+
+    model = models.resnet18(
+        weights=weights
+    )
+
+    number_of_features = (
+        model.fc.in_features
+    )
+
+    model.fc = nn.Linear(
+        number_of_features,
+        2,
+    )
+
+    model = model.to(
+        device
+    )
+
+    # ========================================================
+    # LOSS
+    # ========================================================
+
+    criterion = (
+        nn.CrossEntropyLoss()
+    )
+
+    # ========================================================
+    # OPTIMIZER
+    # ========================================================
+
+    optimizer = (
+        torch.optim.AdamW(
+            model.parameters(),
+            lr=args.learning_rate,
+            weight_decay=1e-4,
+        )
+    )
+
+    # ========================================================
+    # TRAIN
+    # ========================================================
+
+    model = train_model(
+        model=model,
+        train_loader=train_loader,
+        validation_loader=validation_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        device=device,
+        epochs=args.epochs,
+        output_dir=output_dir,
+    )
+
+    # ========================================================
+    # SAVE CLASS INFORMATION
+    # ========================================================
+
+    class_info = {
+
+        "classes": [
+            "bad",
+            "good",
+        ],
+
+        "class_to_idx": {
+            "bad": 0,
+            "good": 1,
+        },
+    }
+
+    with open(
+        output_dir
+        / "classes.json",
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        json.dump(
+            class_info,
+            file,
+            indent=4,
+        )
+
+    # ========================================================
+    # FINAL TEST
+    # ========================================================
+
+    test_model(
+        model=model,
+        test_loader=test_loader,
+        device=device,
+        output_dir=output_dir,
+    )
+
+    print("\n")
+    print("=" * 70)
+    print("FINISHED")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()

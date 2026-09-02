@@ -1,0 +1,437 @@
+from pathlib import Path
+import random
+import shutil
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+# Βάλε εδώ τους 3 processed tray folders
+TRAY_FOLDERS = [
+    Path(r"C:\path\to\83_processed"),
+    Path(r"C:\path\to\84_processed"),
+    Path(r"C:\path\to\third_tray_processed"),
+]
+
+# Πού θα δημιουργηθούν τα τελικά datasets
+OUTPUT_ROOT = Path(r"C:\path\to\final_datasets")
+
+
+# ------------------------------------------------------------
+# Number of images for the small dataset
+# ------------------------------------------------------------
+
+N_SELECTED_PER_CLASS = 100
+
+
+# ------------------------------------------------------------
+# Train / validation / test ratios
+# ------------------------------------------------------------
+
+TRAIN_RATIO = 0.70
+VALIDATION_RATIO = 0.15
+TEST_RATIO = 0.15
+
+
+# ------------------------------------------------------------
+# Reproducibility
+# ------------------------------------------------------------
+
+RANDOM_SEED = 42
+
+
+# ------------------------------------------------------------
+# Supported images
+# ------------------------------------------------------------
+
+IMAGE_EXTENSIONS = {
+    ".bmp",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tif",
+    ".tiff",
+}
+
+
+# ============================================================
+# MAPPING
+#
+# Input:
+#     ViTop
+#     ViBottom
+#
+# Output:
+#     top
+#     bottom
+# ============================================================
+
+POSITIONS = {
+    "ViTop": "top",
+    "ViBottom": "bottom",
+}
+
+LABELS = {
+    "Good": "good",
+    "Bad": "bad",
+}
+
+
+# ============================================================
+# FUNCTIONS
+# ============================================================
+
+def get_images(folder):
+    """
+    Return all images directly inside folder.
+    """
+
+    if not folder.exists():
+        raise FileNotFoundError(
+            f"Folder does not exist:\n{folder}"
+        )
+
+    return [
+        file
+        for file in folder.iterdir()
+        if file.is_file()
+        and file.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+
+
+def collect_from_all_trays(input_position, input_label):
+    """
+    Collect images of one category from all trays.
+
+    Example:
+
+    83_processed/ViTop/Good
+    84_processed/ViTop/Good
+    tray3_processed/ViTop/Good
+
+            ↓
+
+       one combined list
+    """
+
+    combined = []
+
+    print()
+    print(
+        f"Collecting {input_position}/{input_label}"
+    )
+
+    for tray_number, tray_folder in enumerate(
+        TRAY_FOLDERS,
+        start=1,
+    ):
+
+        source_folder = (
+            tray_folder
+            / input_position
+            / input_label
+        )
+
+        images = get_images(source_folder)
+
+        print(
+            f"  Tray {tray_number}: "
+            f"{len(images)} images"
+        )
+
+        for image in images:
+
+            combined.append(
+                {
+                    "path": image,
+
+                    # Used to avoid filename collisions
+                    "tray_name": tray_folder.name,
+                }
+            )
+
+    print(
+        f"  TOTAL: {len(combined)} images"
+    )
+
+    return combined
+
+
+def split_images(images, rng):
+    """
+    Randomly split images into:
+
+        train
+        validation
+        test
+
+    No image can appear in two splits.
+    """
+
+    images = images.copy()
+
+    rng.shuffle(images)
+
+    n_total = len(images)
+
+    n_train = int(
+        n_total * TRAIN_RATIO
+    )
+
+    n_validation = int(
+        n_total * VALIDATION_RATIO
+    )
+
+    # Everything remaining goes to test,
+    # so no images are lost due to rounding.
+    n_test = (
+        n_total
+        - n_train
+        - n_validation
+    )
+
+    train = images[
+        :n_train
+    ]
+
+    validation = images[
+        n_train:
+        n_train + n_validation
+    ]
+
+    test = images[
+        n_train + n_validation:
+    ]
+
+    assert (
+        len(train)
+        + len(validation)
+        + len(test)
+        == n_total
+    )
+
+    return {
+        "train": train,
+        "validation": validation,
+        "test": test,
+    }
+
+
+def copy_split(
+    split_data,
+    dataset_root,
+    position,
+    label,
+):
+    """
+    Copy train/validation/test files
+    to their final folders.
+    """
+
+    for split_name, images in split_data.items():
+
+        destination_folder = (
+            dataset_root
+            / position
+            / label
+            / split_name
+        )
+
+        destination_folder.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        for item in images:
+
+            source = item["path"]
+            tray_name = item["tray_name"]
+
+            # Example:
+            #
+            # 84_processed__image123.bmp
+            #
+            # Prevents overwriting if different
+            # trays contain same filenames.
+            destination_name = (
+                f"{tray_name}__"
+                f"{source.name}"
+            )
+
+            destination = (
+                destination_folder
+                / destination_name
+            )
+
+            shutil.copy2(
+                source,
+                destination,
+            )
+
+
+def print_split_summary(
+    name,
+    split_data,
+):
+
+    print(
+        f"\n{name}"
+    )
+
+    for split_name, images in split_data.items():
+
+        print(
+            f"    {split_name:<12}"
+            f"{len(images)}"
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    # Check ratios
+    ratio_sum = (
+        TRAIN_RATIO
+        + VALIDATION_RATIO
+        + TEST_RATIO
+    )
+
+    if abs(ratio_sum - 1.0) > 1e-9:
+        raise ValueError(
+            "TRAIN_RATIO + VALIDATION_RATIO + "
+            "TEST_RATIO must equal 1.0"
+        )
+
+    rng = random.Random(
+        RANDOM_SEED
+    )
+
+    selected_root = (
+        OUTPUT_ROOT
+        / "selected_100"
+    )
+
+    all_root = (
+        OUTPUT_ROOT
+        / "all_images"
+    )
+
+    print("=" * 70)
+    print("BUILDING DATASETS")
+    print("=" * 70)
+
+    # ========================================================
+    # TOP / BOTTOM
+    # ========================================================
+
+    for input_position, output_position in POSITIONS.items():
+
+        # ====================================================
+        # GOOD / BAD
+        # ====================================================
+
+        for input_label, output_label in LABELS.items():
+
+            print("\n")
+            print("=" * 70)
+
+            print(
+                f"{output_position.upper()} / "
+                f"{output_label.upper()}"
+            )
+
+            print("=" * 70)
+
+            # ------------------------------------------------
+            # Collect ALL images from all 3 trays
+            # ------------------------------------------------
+
+            all_images = collect_from_all_trays(
+                input_position=input_position,
+                input_label=input_label,
+            )
+
+            # =================================================
+            # DATASET 1:
+            # SELECTED 100
+            # =================================================
+
+            if len(all_images) < N_SELECTED_PER_CLASS:
+
+                raise ValueError(
+                    f"\nNot enough images for "
+                    f"{output_position}/{output_label}\n"
+                    f"Requested: {N_SELECTED_PER_CLASS}\n"
+                    f"Available: {len(all_images)}"
+                )
+
+            selected_images = rng.sample(
+                all_images,
+                N_SELECTED_PER_CLASS,
+            )
+
+            selected_split = split_images(
+                selected_images,
+                rng,
+            )
+
+            copy_split(
+                split_data=selected_split,
+                dataset_root=selected_root,
+                position=output_position,
+                label=output_label,
+            )
+
+            print_split_summary(
+                "SELECTED 100:",
+                selected_split,
+            )
+
+            # =================================================
+            # DATASET 2:
+            # ALL IMAGES
+            # =================================================
+
+            all_split = split_images(
+                all_images,
+                rng,
+            )
+
+            copy_split(
+                split_data=all_split,
+                dataset_root=all_root,
+                position=output_position,
+                label=output_label,
+            )
+
+            print_split_summary(
+                "ALL IMAGES:",
+                all_split,
+            )
+
+    # ========================================================
+    # FINISHED
+    # ========================================================
+
+    print("\n")
+    print("=" * 70)
+    print("DONE")
+    print("=" * 70)
+
+    print(
+        f"\nSelected 100 dataset:\n"
+        f"{selected_root}"
+    )
+
+    print(
+        f"\nAll images dataset:\n"
+        f"{all_root}"
+    )
+
+
+if __name__ == "__main__":
+    main()

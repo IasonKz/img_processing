@@ -1,0 +1,245 @@
+from pathlib import Path
+import shutil
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+TRAY_FOLDERS = [
+    Path(r"C:\path\to\tray_1"),
+    Path(r"C:\path\to\tray_2"),
+    Path(r"C:\path\to\tray_3"),
+]
+
+OUTPUT_FOLDER = Path(r"C:\path\to\COMBINED_DATASET")
+
+
+IMAGE_EXTENSIONS = {
+    ".bmp",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tif",
+    ".tiff",
+}
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+POSITIONS = [
+    "top",
+    "bottom",
+]
+
+LABELS = [
+    "good",
+    "bad",
+]
+
+SPLITS = [
+    "train",
+    "test",
+    "validation",
+]
+
+
+# ============================================================
+# FUNCTIONS
+# ============================================================
+
+def get_images(folder):
+    """
+    Get all image files from a folder.
+    """
+
+    if not folder.exists():
+        print(f"WARNING: Folder does not exist: {folder}")
+        return []
+
+    return [
+        file
+        for file in folder.iterdir()
+        if file.is_file()
+        and file.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+
+
+def copy_split(
+    tray_folder,
+    tray_number,
+    output_folder,
+    position,
+    label,
+    split,
+):
+    """
+    Copy images from one tray into the combined dataset.
+
+    Example:
+
+    tray_1/top/good/train/
+
+            ->
+
+    combined/top/good/train/
+    """
+
+    source_folder = (
+        tray_folder
+        / position
+        / label
+        / split
+    )
+
+    destination_folder = (
+        output_folder
+        / position
+        / label
+        / split
+    )
+
+    destination_folder.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    images = get_images(source_folder)
+
+    print(
+        f"Tray {tray_number} | "
+        f"{position}/{label}/{split}: "
+        f"{len(images)} images"
+    )
+
+    for image in images:
+
+        # Add tray prefix so files with the same name
+        # from different trays cannot overwrite each other.
+        new_filename = (
+            f"tray{tray_number}_"
+            f"{image.name}"
+        )
+
+        destination_path = (
+            destination_folder
+            / new_filename
+        )
+
+        shutil.copy2(
+            image,
+            destination_path,
+        )
+
+    return len(images)
+
+
+def count_images(folder):
+    """
+    Count images inside a folder.
+    """
+
+    return len(get_images(folder))
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print("\n")
+    print("=" * 70)
+    print("COMBINING DATASETS")
+    print("=" * 70)
+
+    total_copied = 0
+
+    # --------------------------------------------------------
+    # COPY DATA
+    # --------------------------------------------------------
+
+    for tray_number, tray_folder in enumerate(
+        TRAY_FOLDERS,
+        start=1,
+    ):
+
+        print("\n")
+        print("=" * 70)
+        print(f"TRAY {tray_number}")
+        print(f"Path: {tray_folder}")
+        print("=" * 70)
+
+        for position in POSITIONS:
+
+            for label in LABELS:
+
+                for split in SPLITS:
+
+                    copied = copy_split(
+                        tray_folder=tray_folder,
+                        tray_number=tray_number,
+                        output_folder=OUTPUT_FOLDER,
+                        position=position,
+                        label=label,
+                        split=split,
+                    )
+
+                    total_copied += copied
+
+    # --------------------------------------------------------
+    # FINAL SUMMARY
+    # --------------------------------------------------------
+
+    print("\n")
+    print("=" * 70)
+    print("FINAL COMBINED DATASET")
+    print("=" * 70)
+
+    grand_total = 0
+
+    for position in POSITIONS:
+
+        print(f"\n{position.upper()}")
+
+        for label in LABELS:
+
+            print(f"  {label.upper()}")
+
+            for split in SPLITS:
+
+                folder = (
+                    OUTPUT_FOLDER
+                    / position
+                    / label
+                    / split
+                )
+
+                n_images = count_images(folder)
+
+                grand_total += n_images
+
+                print(
+                    f"    {split:<12}: "
+                    f"{n_images} images"
+                )
+
+    print("\n" + "=" * 70)
+
+    print(
+        f"TOTAL IMAGES IN COMBINED DATASET: "
+        f"{grand_total}"
+    )
+
+    print(
+        f"Output folder: {OUTPUT_FOLDER}"
+    )
+
+    print("=" * 70)
+    print("DONE")
+
+
+if __name__ == "__main__":
+    main()

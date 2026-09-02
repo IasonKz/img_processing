@@ -1,0 +1,177 @@
+pip install torch torchvision scikit-learn pillow numpy
+
+
+python train_bottom.py --data "C:\...\bottom" --output "bottom_model_output" --epochs 15 --batch-size 8
+
+
+
+
+
+def evaluate_test_set(
+    model,
+    test_loader,
+    test_dataset,
+    device,
+    class_names,
+    output_dir,
+):
+
+    model.eval()
+
+    all_labels = []
+    all_predictions = []
+
+    rows = []
+
+    sample_index = 0
+
+    with torch.no_grad():
+
+        for images, labels in test_loader:
+
+            images = images.to(device)
+
+            outputs = model(images)
+
+            probabilities = torch.softmax(outputs, dim=1)
+            predictions = torch.argmax(probabilities, dim=1)
+
+            probabilities_cpu = probabilities.cpu().numpy()
+            predictions_cpu = predictions.cpu().numpy()
+            labels_cpu = labels.cpu().numpy()
+
+            for i in range(len(labels_cpu)):
+
+                # Because test DataLoader uses shuffle=False,
+                # this corresponds to the same sample order
+                image_path, _ = test_dataset.samples[sample_index]
+
+                actual_index = int(labels_cpu[i])
+                predicted_index = int(predictions_cpu[i])
+
+                actual_label = class_names[actual_index]
+                predicted_label = class_names[predicted_index]
+
+                row = {
+                    "image_name": Path(image_path).name,
+                    "image_path": str(image_path),
+                    "actual_label": actual_label,
+                    "predicted_label": predicted_label,
+                    "correct": actual_label == predicted_label,
+                }
+
+                # Add probability for every class
+                for class_index, class_name in enumerate(class_names):
+
+                    row[f"probability_{class_name}"] = float(
+                        probabilities_cpu[i][class_index]
+                    )
+
+                rows.append(row)
+
+                sample_index += 1
+
+            all_labels.extend(labels_cpu)
+            all_predictions.extend(predictions_cpu)
+
+    # ========================================================
+    # Overall metrics
+    # ========================================================
+
+    accuracy = accuracy_score(
+        all_labels,
+        all_predictions,
+    )
+
+    print("\n")
+    print("=" * 70)
+    print("TEST RESULTS")
+    print("=" * 70)
+
+    print(f"\nTest accuracy: {accuracy:.4f}")
+
+    print("\nClassification report:\n")
+
+    print(
+        classification_report(
+            all_labels,
+            all_predictions,
+            target_names=class_names,
+            digits=4,
+        )
+    )
+
+    print("Confusion matrix:\n")
+
+    cm = confusion_matrix(
+        all_labels,
+        all_predictions,
+    )
+
+    print(cm)
+
+    # ========================================================
+    # Save predictions to CSV
+    # ========================================================
+
+    csv_path = output_dir / "test_predictions.csv"
+
+    if rows:
+
+        fieldnames = list(rows[0].keys())
+
+        with open(
+            csv_path,
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as csv_file:
+
+            writer = csv.DictWriter(
+                csv_file,
+                fieldnames=fieldnames,
+            )
+
+            writer.writeheader()
+            writer.writerows(rows)
+
+    print(f"\nPredictions saved to:")
+    print(csv_path)
+
+    # ========================================================
+    # Print wrong predictions
+    # ========================================================
+
+    wrong_predictions = [
+        row for row in rows
+        if not row["correct"]
+    ]
+
+    print("\n")
+    print("=" * 70)
+    print("MISCLASSIFIED IMAGES")
+    print("=" * 70)
+
+    print(
+        f"\nWrong predictions: "
+        f"{len(wrong_predictions)} / {len(rows)}"
+    )
+
+    for row in wrong_predictions:
+
+        print(
+            f"\n{row['image_name']}"
+            f"\n  Actual:    {row['actual_label']}"
+            f"\n  Predicted: {row['predicted_label']}"
+        )
+
+        for class_name in class_names:
+
+            probability = row[
+                f"probability_{class_name}"
+            ]
+
+            print(
+                f"  P({class_name}): "
+                f"{probability * 100:.2f}%"
+            )

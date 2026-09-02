@@ -1,0 +1,207 @@
+from pathlib import Path
+import random
+import shutil
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+TRAY_FOLDERS = [
+    Path(r"C:\path\to\tray_1"),
+    Path(r"C:\path\to\tray_2"),
+    Path(r"C:\path\to\tray_3"),
+]
+
+OUTPUT_FOLDER = Path(r"C:\path\to\selected_dataset")
+
+N_IMAGES_PER_CLASS = 100
+
+# Same seed -> same random selection every time
+RANDOM_SEED = 42
+
+IMAGE_EXTENSIONS = {
+    ".bmp",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tif",
+    ".tiff",
+}
+
+
+# ============================================================
+# FUNCTIONS
+# ============================================================
+
+def get_images(folder):
+    """
+    Return all images inside a folder.
+    """
+    if not folder.exists():
+        raise FileNotFoundError(f"Folder does not exist: {folder}")
+
+    return [
+        file
+        for file in folder.iterdir()
+        if file.is_file() and file.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+
+
+def collect_images(tray_folders, category, label):
+    """
+    Collect all images from:
+
+    tray_1/category/label
+    tray_2/category/label
+    tray_3/category/label
+
+    Example:
+        category = "top"
+        label = "good"
+    """
+
+    all_images = []
+
+    for tray_index, tray_folder in enumerate(tray_folders, start=1):
+
+        source_folder = tray_folder / category / label
+
+        images = get_images(source_folder)
+
+        print(
+            f"Tray {tray_index}: "
+            f"{category}/{label} -> {len(images)} images"
+        )
+
+        # Keep tray information together with image path
+        for image in images:
+            all_images.append(
+                {
+                    "path": image,
+                    "tray_index": tray_index,
+                }
+            )
+
+    return all_images
+
+
+def select_and_copy(
+    tray_folders,
+    output_folder,
+    category,
+    label,
+    n_images,
+    rng,
+):
+    """
+    Randomly select n_images from the combined pool
+    of all trays and copy them to the output folder.
+    """
+
+    images = collect_images(
+        tray_folders,
+        category,
+        label,
+    )
+
+    print(
+        f"\nTotal available for {category}/{label}: "
+        f"{len(images)}"
+    )
+
+    if len(images) < n_images:
+        raise ValueError(
+            f"Not enough images for {category}/{label}.\n"
+            f"Requested: {n_images}\n"
+            f"Available: {len(images)}"
+        )
+
+    selected = rng.sample(images, n_images)
+
+    destination_folder = output_folder / category / label
+    destination_folder.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    for item in selected:
+
+        source_path = item["path"]
+        tray_index = item["tray_index"]
+
+        # Prefix prevents overwriting if two trays
+        # contain images with the same filename.
+        destination_name = (
+            f"tray{tray_index}_"
+            f"{source_path.name}"
+        )
+
+        destination_path = (
+            destination_folder / destination_name
+        )
+
+        shutil.copy2(
+            source_path,
+            destination_path,
+        )
+
+    print(
+        f"Selected and copied {n_images} images "
+        f"to {destination_folder}\n"
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    rng = random.Random(RANDOM_SEED)
+
+    categories = [
+        "top",
+        "bottom",
+    ]
+
+    labels = [
+        "good",
+        "bad",
+    ]
+
+    for category in categories:
+        for label in labels:
+
+            print("=" * 60)
+            print(
+                f"Processing: {category}/{label}"
+            )
+            print("=" * 60)
+
+            select_and_copy(
+                tray_folders=TRAY_FOLDERS,
+                output_folder=OUTPUT_FOLDER,
+                category=category,
+                label=label,
+                n_images=N_IMAGES_PER_CLASS,
+                rng=rng,
+            )
+
+    print("\nDONE!")
+    print("\nFinal dataset:")
+
+    for category in categories:
+        for label in labels:
+
+            folder = OUTPUT_FOLDER / category / label
+            number = len(get_images(folder))
+
+            print(
+                f"{category}/{label}: "
+                f"{number} images"
+            )
+
+
+if __name__ == "__main__":
+    main()

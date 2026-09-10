@@ -1,0 +1,1511 @@
+from __future__ import annotations
+
+import csv
+import json
+import re
+import shutil
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Optional
+
+import cv2
+import numpy as np
+from skimage.metrics import structural_similarity
+
+
+# ============================================================
+# USER CONFIGURATION
+# ============================================================
+
+# Folder somewhere ABOVE all ViTopStart / ViTopFinal images.
+INPUT_ROOT = Path(
+    r"C:\Users\iaka\software\data\C00000083\MeasurementData\Results"
+)
+
+# IMPORTANT:
+# Use a NEW output folder. Originals are never changed.
+OUTPUT_ROOT = Path(
+    r"C:\Users\iaka\software\data\C00000083\start_final_comparison"
+)
+
+# For TOP:
+START_TOKEN = "ViTopStart"
+FINAL_TOKEN = "ViTopFinal"
+
+# Supported image extensions
+IMAGE_EXTENSIONS = {
+    ".bmp",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tif",
+    ".tiff",
+}
+
+# ------------------------------------------------------------
+# PREPROCESSING
+# ------------------------------------------------------------
+
+# 1.0 = use the complete image.
+#
+# If the die occupies only the central part of the raw picture,
+# something like 0.50 - 0.65 may be better.
+#
+# Example:
+# 0.55 means use the central 55% of the image width/height.
+CENTER_CROP_FRACTION = 0.55
+
+# Ignore borders after alignment because warping can create artifacts.
+BORDER_IGNORE_PX = 12
+
+
+# ------------------------------------------------------------
+# ECC ALIGNMENT
+# ------------------------------------------------------------
+
+ECC_ITERATIONS = 250
+ECC_EPSILON = 1e-6
+
+
+# ------------------------------------------------------------
+# CHANGE MAP WEIGHTS
+# ------------------------------------------------------------
+
+# Combined map:
+#
+# D = w1 * absolute_difference
+#   + w2 * SSIM_difference
+#   + w3 * gradient_difference
+
+WEIGHT_ABSDIFF = 0.45
+WEIGHT_SSIM = 0.35
+WEIGHT_GRADIENT = 0.20
+
+
+# ------------------------------------------------------------
+# DEFECT MASK
+# ------------------------------------------------------------
+
+# Robust threshold:
+#
+# threshold = median + MAD_MULTIPLIER * sigma_MAD
+#
+MAD_MULTIPLIER = 6.0
+
+# Never allow the threshold to become unrealistically low.
+MIN_CHANGE_THRESHOLD = 0.10
+
+# Connected regions smaller than this are ignored as noise.
+MIN_COMPONENT_AREA_PX = 25
+
+
+# ------------------------------------------------------------
+# FINAL CLASSIFICATION THRESHOLDS
+# ------------------------------------------------------------
+
+# Fraction of valid image pixels marked as changed.
+CHANGED_PIXEL_RATIO_THRESHOLD = 0.0020       # 0.20 %
+
+# Largest connected changed region as fraction of image area.
+MAX_COMPONENT_RATIO_THRESHOLD = 0.0008       # 0.08 %
+
+# Global SSIM alone does NOT determine the class.
+# It is used together with actual changed regions.
+STRUCTURAL_SSIM_THRESHOLD = 0.975
+
+# Extra changed-pixel requirement when SSIM is poor.
+SSIM_CHANGE_RATIO_MIN = 0.0005
+
+
+# ============================================================
+# REGEX
+# ============================================================
+
+UNIT_PATTERN = re.compile(
+    r"(Rc\d+Cc\d+)",
+    flags=re.IGNORECASE,
+)
+
+TIMESTAMP_PATTERN = re.compile(
+    r"(20\d{6}T\d{6})",
+    flags=re.IGNORECASE,
+)
+
+
+# ============================================================
+# DATA TYPES
+# ============================================================
+
+@dataclass
+class PairResult:
+    unit: str
+    pair_number: int
+
+    start_path: str
+    final_path: str
+
+    selected_rotation_deg: int
+    ecc_score: float
+
+    global_ssim: float
+
+    changed_pixel_ratio: float
+    max_component_ratio: float
+    max_component_area_px: int
+    number_components: int
+
+    threshold_used: float
+    severity: float
+
+    classification: str
+    reason: str
+
+
+# ============================================================
+# BASIC IMAGE UTILITIES
+# ============================================================
+
+def load_gray(path: Path) -> np.ndarray:
+    """
+    Load an image without modifying the original.
+    Returns grayscale uint8.
+    """
+
+    img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+
+    if img is None:
+        raise RuntimeError(f"Could not read image: {path}")
+
+    return img
+
+
+def center_crop(
+    image: np.ndarray,
+    fraction: float,
+) -> np.ndarray:
+    """
+    Crop around the image centre while keeping the original resolution.
+    No resizing is performed.
+    """
+
+    if not (0 < fraction <= 1.0):
+        raise ValueError("CENTER_CROP_FRACTION must be between 0 and 1.")
+
+    h, w = image.shape
+
+    crop_h = int(round(h * fraction))
+    crop_w = int(round(w * fraction))
+
+    # Keep even dimensions because rotations/alignment are easier.
+    crop_h -= crop_h % 2
+    crop_w -= crop_w % 2
+
+    y0 = (h - crop_h) // 2
+    x0 = (w - crop_w) // 2
+
+    return image[
+        y0:y0 + crop_h,
+        x0:x0 + crop_w,
+    ].copy()
+
+
+def make_common_square(
+    image1: np.ndarray,
+    image2: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Crop both images to the largest common central square.
+
+    This avoids resizing while ensuring 90 degree rotations
+    remain compatible.
+    """
+
+    size = min(
+        image1.shape[0],
+        image1.shape[1],
+        image2.shape[0],
+        image2.shape[1],
+    )
+
+    # Make even.
+    size -= size % 2
+
+    def crop_square(img: np.ndarray) -> np.ndarray:
+        h, w = img.shape
+
+        y0 = (h - size) // 2
+        x0 = (w - size) // 2
+
+        return img[
+            y0:y0 + size,
+            x0:x0 + size,
+        ].copy()
+
+    return crop_square(image1), crop_square(image2)
+
+
+# ============================================================
+# PHOTOMETRIC NORMALIZATION
+# ============================================================
+
+def normalize_brightness_contrast(
+    reference: np.ndarray,
+    moving: np.ndarray,
+) -> np.ndarray:
+    """
+    Adjust mean brightness and contrast of moving image
+    to approximately match the reference image.
+
+    moving' = (moving - mean_moving) *
+              (std_reference / std_moving) +
+              mean_reference
+
+    This helps prevent brightness/contrast differences from
+    being interpreted as physical damage.
+    """
+
+    ref = reference.astype(np.float32)
+    mov = moving.astype(np.float32)
+
+    mean_ref = float(np.mean(ref))
+    std_ref = float(np.std(ref))
+
+    mean_mov = float(np.mean(mov))
+    std_mov = float(np.std(mov))
+
+    if std_mov < 1e-6:
+        return moving.copy()
+
+    corrected = (
+        (mov - mean_mov)
+        * (std_ref / std_mov)
+        + mean_ref
+    )
+
+    corrected = np.clip(corrected, 0, 255)
+
+    return corrected.astype(np.uint8)
+
+
+def normalize_for_ecc(image: np.ndarray) -> np.ndarray:
+    """
+    Produce float32 normalized image for ECC.
+    """
+
+    img = image.astype(np.float32)
+
+    mean = np.mean(img)
+    std = np.std(img)
+
+    if std < 1e-6:
+        return np.zeros_like(img, dtype=np.float32)
+
+    return (img - mean) / std
+
+
+# ============================================================
+# ROTATION
+# ============================================================
+
+def rotate_90(
+    image: np.ndarray,
+    rotation: int,
+) -> np.ndarray:
+
+    if rotation == 0:
+        return image.copy()
+
+    if rotation == 90:
+        return cv2.rotate(
+            image,
+            cv2.ROTATE_90_CLOCKWISE,
+        )
+
+    if rotation == 180:
+        return cv2.rotate(
+            image,
+            cv2.ROTATE_180,
+        )
+
+    if rotation == 270:
+        return cv2.rotate(
+            image,
+            cv2.ROTATE_90_COUNTERCLOCKWISE,
+        )
+
+    raise ValueError(f"Unsupported rotation: {rotation}")
+
+
+# ============================================================
+# ECC ALIGNMENT
+# ============================================================
+
+def ecc_align(
+    reference: np.ndarray,
+    moving: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """
+    Align moving image to reference.
+
+    First tries Euclidean motion:
+        translation + small rotation.
+
+    If that fails, tries translation only.
+
+    If both fail, returns the original moving image.
+    """
+
+    template = normalize_for_ecc(reference)
+    input_img = normalize_for_ecc(moving)
+
+    h, w = reference.shape
+
+    criteria = (
+        cv2.TERM_CRITERIA_EPS
+        | cv2.TERM_CRITERIA_COUNT,
+        ECC_ITERATIONS,
+        ECC_EPSILON,
+    )
+
+    motion_types = [
+        cv2.MOTION_EUCLIDEAN,
+        cv2.MOTION_TRANSLATION,
+    ]
+
+    for motion_type in motion_types:
+
+        warp = np.eye(
+            2,
+            3,
+            dtype=np.float32,
+        )
+
+        try:
+
+            cc, warp = cv2.findTransformECC(
+                template,
+                input_img,
+                warp,
+                motion_type,
+                criteria,
+                None,
+                5,
+            )
+
+            aligned = cv2.warpAffine(
+                moving,
+                warp,
+                (w, h),
+                flags=(
+                    cv2.INTER_LINEAR
+                    | cv2.WARP_INVERSE_MAP
+                ),
+                borderMode=cv2.BORDER_REFLECT101,
+            )
+
+            return aligned, float(cc)
+
+        except cv2.error:
+            pass
+
+    return moving.copy(), -1.0
+
+
+# ============================================================
+# FIND BEST ROTATION
+# ============================================================
+
+def select_best_rotation(
+    start: np.ndarray,
+    final: np.ndarray,
+) -> tuple[
+    np.ndarray,
+    int,
+    float,
+    float,
+]:
+    """
+    Test:
+        0
+        90
+        180
+        270 degrees
+
+    Align each candidate.
+
+    Select the candidate with the highest SSIM after
+    brightness/contrast normalization.
+    """
+
+    best_image = None
+    best_rotation = 0
+    best_ecc = -1.0
+    best_ssim = -1.0
+
+    for rotation in [0, 90, 180, 270]:
+
+        candidate = rotate_90(
+            final,
+            rotation,
+        )
+
+        aligned, ecc_score = ecc_align(
+            start,
+            candidate,
+        )
+
+        normalized = normalize_brightness_contrast(
+            start,
+            aligned,
+        )
+
+        score = structural_similarity(
+            start,
+            normalized,
+            data_range=255,
+        )
+
+        if score > best_ssim:
+            best_ssim = float(score)
+            best_image = normalized
+            best_rotation = rotation
+            best_ecc = ecc_score
+
+    assert best_image is not None
+
+    return (
+        best_image,
+        best_rotation,
+        best_ecc,
+        best_ssim,
+    )
+
+
+# ============================================================
+# DIFFERENCE MAPS
+# ============================================================
+
+def absolute_difference_map(
+    start: np.ndarray,
+    final: np.ndarray,
+) -> np.ndarray:
+
+    diff = cv2.absdiff(
+        start,
+        final,
+    )
+
+    return diff.astype(np.float32) / 255.0
+
+
+def ssim_difference_map(
+    start: np.ndarray,
+    final: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """
+    Returns:
+        local SSIM difference map in [0,1]
+        global SSIM value
+    """
+
+    score, similarity_map = structural_similarity(
+        start,
+        final,
+        data_range=255,
+        full=True,
+    )
+
+    difference = 1.0 - similarity_map.astype(np.float32)
+
+    difference = np.clip(
+        difference,
+        0.0,
+        1.0,
+    )
+
+    return difference, float(score)
+
+
+def gradient_magnitude(
+    image: np.ndarray,
+) -> np.ndarray:
+
+    img = image.astype(np.float32) / 255.0
+
+    gx = cv2.Sobel(
+        img,
+        cv2.CV_32F,
+        1,
+        0,
+        ksize=3,
+    )
+
+    gy = cv2.Sobel(
+        img,
+        cv2.CV_32F,
+        0,
+        1,
+        ksize=3,
+    )
+
+    magnitude = cv2.magnitude(
+        gx,
+        gy,
+    )
+
+    return magnitude
+
+
+def gradient_difference_map(
+    start: np.ndarray,
+    final: np.ndarray,
+) -> np.ndarray:
+
+    g1 = gradient_magnitude(start)
+    g2 = gradient_magnitude(final)
+
+    diff = np.abs(g1 - g2)
+
+    # Robust normalization.
+    scale = np.percentile(
+        diff,
+        99.5,
+    )
+
+    if scale < 1e-8:
+        return np.zeros_like(
+            diff,
+            dtype=np.float32,
+        )
+
+    diff = diff / scale
+
+    return np.clip(
+        diff,
+        0.0,
+        1.0,
+    )
+
+
+# ============================================================
+# BORDER MASK
+# ============================================================
+
+def valid_region_mask(
+    shape: tuple[int, int],
+) -> np.ndarray:
+
+    h, w = shape
+
+    mask = np.ones(
+        (h, w),
+        dtype=np.uint8,
+    )
+
+    b = BORDER_IGNORE_PX
+
+    if b > 0:
+
+        mask[:b, :] = 0
+        mask[-b:, :] = 0
+        mask[:, :b] = 0
+        mask[:, -b:] = 0
+
+    return mask
+
+
+# ============================================================
+# ROBUST THRESHOLD
+# ============================================================
+
+def calculate_robust_threshold(
+    change_map: np.ndarray,
+    valid_mask: np.ndarray,
+) -> float:
+
+    values = change_map[
+        valid_mask > 0
+    ]
+
+    median = float(
+        np.median(values)
+    )
+
+    mad = float(
+        np.median(
+            np.abs(values - median)
+        )
+    )
+
+    # MAD equivalent estimate of Gaussian sigma.
+    robust_sigma = 1.4826 * mad
+
+    threshold = (
+        median
+        + MAD_MULTIPLIER
+        * robust_sigma
+    )
+
+    threshold = max(
+        threshold,
+        MIN_CHANGE_THRESHOLD,
+    )
+
+    return float(threshold)
+
+
+# ============================================================
+# COMPONENT ANALYSIS
+# ============================================================
+
+def clean_and_analyse_mask(
+    change_map: np.ndarray,
+    valid_mask: np.ndarray,
+) -> tuple[
+    np.ndarray,
+    float,
+    int,
+    float,
+    int,
+]:
+    """
+    Returns:
+        cleaned mask
+        changed pixel ratio
+        largest component area
+        largest component ratio
+        number of valid components
+    """
+
+    threshold = calculate_robust_threshold(
+        change_map,
+        valid_mask,
+    )
+
+    binary = (
+        change_map > threshold
+    ).astype(np.uint8)
+
+    binary *= valid_mask
+
+    # Remove isolated pixel noise.
+    kernel_open = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (3, 3),
+    )
+
+    binary = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_OPEN,
+        kernel_open,
+    )
+
+    # Join very close neighbouring defect pixels.
+    kernel_close = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (5, 5),
+    )
+
+    binary = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_CLOSE,
+        kernel_close,
+    )
+
+    n_labels, labels, stats, centroids = (
+        cv2.connectedComponentsWithStats(
+            binary,
+            connectivity=8,
+        )
+    )
+
+    cleaned = np.zeros_like(binary)
+
+    component_areas = []
+
+    for label in range(1, n_labels):
+
+        area = int(
+            stats[
+                label,
+                cv2.CC_STAT_AREA,
+            ]
+        )
+
+        if area < MIN_COMPONENT_AREA_PX:
+            continue
+
+        cleaned[
+            labels == label
+        ] = 1
+
+        component_areas.append(area)
+
+    valid_pixels = int(
+        np.sum(valid_mask > 0)
+    )
+
+    changed_pixels = int(
+        np.sum(cleaned > 0)
+    )
+
+    changed_ratio = (
+        changed_pixels / valid_pixels
+        if valid_pixels
+        else 0.0
+    )
+
+    max_component_area = (
+        max(component_areas)
+        if component_areas
+        else 0
+    )
+
+    max_component_ratio = (
+        max_component_area / valid_pixels
+        if valid_pixels
+        else 0.0
+    )
+
+    return (
+        cleaned,
+        changed_ratio,
+        max_component_area,
+        max_component_ratio,
+        len(component_areas),
+    )
+
+
+# ============================================================
+# CLASSIFICATION
+# ============================================================
+
+def classify_pair(
+    global_ssim: float,
+    changed_ratio: float,
+    max_component_ratio: float,
+) -> tuple[str, float, str]:
+    """
+    Explainable rule-based decision.
+
+    Classification is NOT based on global SSIM alone.
+    """
+
+    changed_severity = (
+        changed_ratio
+        / CHANGED_PIXEL_RATIO_THRESHOLD
+    )
+
+    component_severity = (
+        max_component_ratio
+        / MAX_COMPONENT_RATIO_THRESHOLD
+    )
+
+    if global_ssim >= STRUCTURAL_SSIM_THRESHOLD:
+        ssim_severity = 0.0
+    else:
+        ssim_severity = (
+            STRUCTURAL_SSIM_THRESHOLD
+            - global_ssim
+        ) / 0.05
+
+    severity = max(
+        changed_severity,
+        component_severity,
+        ssim_severity,
+    )
+
+    reasons = []
+
+    if (
+        changed_ratio
+        >= CHANGED_PIXEL_RATIO_THRESHOLD
+    ):
+        reasons.append(
+            "changed_pixel_ratio"
+        )
+
+    if (
+        max_component_ratio
+        >= MAX_COMPONENT_RATIO_THRESHOLD
+    ):
+        reasons.append(
+            "large_local_change"
+        )
+
+    if (
+        global_ssim
+        < STRUCTURAL_SSIM_THRESHOLD
+        and changed_ratio
+        >= SSIM_CHANGE_RATIO_MIN
+    ):
+        reasons.append(
+            "structural_change"
+        )
+
+    if reasons:
+        return (
+            "not_similar",
+            float(severity),
+            ", ".join(reasons),
+        )
+
+    return (
+        "similar",
+        float(severity),
+        "no_significant_new_change",
+    )
+
+
+# ============================================================
+# VISUAL OUTPUT
+# ============================================================
+
+def map_to_uint8(
+    image: np.ndarray,
+) -> np.ndarray:
+
+    image = np.clip(
+        image,
+        0.0,
+        1.0,
+    )
+
+    return (
+        image * 255.0
+    ).astype(np.uint8)
+
+
+def make_heatmap(
+    change_map: np.ndarray,
+) -> np.ndarray:
+
+    gray = map_to_uint8(
+        change_map
+    )
+
+    return cv2.applyColorMap(
+        gray,
+        cv2.COLORMAP_JET,
+    )
+
+
+def make_overlay(
+    final: np.ndarray,
+    defect_mask: np.ndarray,
+) -> np.ndarray:
+
+    base = cv2.cvtColor(
+        final,
+        cv2.COLOR_GRAY2BGR,
+    )
+
+    contours, _ = cv2.findContours(
+        (defect_mask * 255).astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    # Green boundaries.
+    cv2.drawContours(
+        base,
+        contours,
+        -1,
+        (0, 255, 0),
+        2,
+    )
+
+    return base
+
+
+# ============================================================
+# FILE DISCOVERY
+# ============================================================
+
+def extract_unit(
+    path: Path,
+) -> Optional[str]:
+
+    match = UNIT_PATTERN.search(
+        path.name
+    )
+
+    if match is None:
+        return None
+
+    return match.group(1)
+
+
+def extract_timestamp(
+    path: Path,
+) -> str:
+
+    match = TIMESTAMP_PATTERN.search(
+        path.name
+    )
+
+    if match:
+        return match.group(1)
+
+    return path.name
+
+
+def discover_images(
+    root: Path,
+) -> tuple[
+    dict[str, list[Path]],
+    dict[str, list[Path]],
+]:
+
+    starts: dict[str, list[Path]] = {}
+    finals: dict[str, list[Path]] = {}
+
+    print("\nSearching for images...")
+
+    for path in root.rglob("*"):
+
+        if not path.is_file():
+            continue
+
+        if (
+            path.suffix.lower()
+            not in IMAGE_EXTENSIONS
+        ):
+            continue
+
+        unit = extract_unit(path)
+
+        if unit is None:
+            continue
+
+        name_lower = path.name.lower()
+
+        if START_TOKEN.lower() in name_lower:
+
+            starts.setdefault(
+                unit,
+                [],
+            ).append(path)
+
+        elif FINAL_TOKEN.lower() in name_lower:
+
+            finals.setdefault(
+                unit,
+                [],
+            ).append(path)
+
+    for images in starts.values():
+        images.sort(
+            key=extract_timestamp
+        )
+
+    for images in finals.values():
+        images.sort(
+            key=extract_timestamp
+        )
+
+    return starts, finals
+
+
+def build_pairs(
+    starts: dict[str, list[Path]],
+    finals: dict[str, list[Path]],
+) -> list[
+    tuple[str, int, Path, Path]
+]:
+
+    all_units = sorted(
+        set(starts)
+        | set(finals)
+    )
+
+    pairs = []
+
+    for unit in all_units:
+
+        unit_starts = starts.get(
+            unit,
+            [],
+        )
+
+        unit_finals = finals.get(
+            unit,
+            [],
+        )
+
+        number_pairs = min(
+            len(unit_starts),
+            len(unit_finals),
+        )
+
+        if len(unit_starts) != len(unit_finals):
+
+            print(
+                f"WARNING {unit}: "
+                f"{len(unit_starts)} Start, "
+                f"{len(unit_finals)} Final"
+            )
+
+        for i in range(number_pairs):
+
+            pairs.append(
+                (
+                    unit,
+                    i + 1,
+                    unit_starts[i],
+                    unit_finals[i],
+                )
+            )
+
+    return pairs
+
+
+# ============================================================
+# PROCESS ONE PAIR
+# ============================================================
+
+def process_pair(
+    unit: str,
+    pair_number: int,
+    start_path: Path,
+    final_path: Path,
+) -> PairResult:
+
+    start_original = load_gray(
+        start_path
+    )
+
+    final_original = load_gray(
+        final_path
+    )
+
+    # Central crop.
+    start = center_crop(
+        start_original,
+        CENTER_CROP_FRACTION,
+    )
+
+    final = center_crop(
+        final_original,
+        CENTER_CROP_FRACTION,
+    )
+
+    # Make both square without scaling.
+    start, final = make_common_square(
+        start,
+        final,
+    )
+
+    (
+        final_aligned,
+        rotation,
+        ecc_score,
+        rotation_ssim,
+    ) = select_best_rotation(
+        start,
+        final,
+    )
+
+    # Calculate final difference maps.
+    abs_map = absolute_difference_map(
+        start,
+        final_aligned,
+    )
+
+    (
+        ssim_map,
+        global_ssim,
+    ) = ssim_difference_map(
+        start,
+        final_aligned,
+    )
+
+    grad_map = gradient_difference_map(
+        start,
+        final_aligned,
+    )
+
+    combined = (
+        WEIGHT_ABSDIFF * abs_map
+        + WEIGHT_SSIM * ssim_map
+        + WEIGHT_GRADIENT * grad_map
+    )
+
+    combined = np.clip(
+        combined,
+        0.0,
+        1.0,
+    )
+
+    valid_mask = valid_region_mask(
+        combined.shape
+    )
+
+    threshold = calculate_robust_threshold(
+        combined,
+        valid_mask,
+    )
+
+    (
+        defect_mask,
+        changed_ratio,
+        max_component_area,
+        max_component_ratio,
+        number_components,
+    ) = clean_and_analyse_mask(
+        combined,
+        valid_mask,
+    )
+
+    (
+        classification,
+        severity,
+        reason,
+    ) = classify_pair(
+        global_ssim,
+        changed_ratio,
+        max_component_ratio,
+    )
+
+    # --------------------------------------------------------
+    # OUTPUT FOLDER
+    # --------------------------------------------------------
+
+    class_root = (
+        OUTPUT_ROOT
+        / classification
+    )
+
+    pair_name = (
+        f"{unit}_pair_{pair_number:02d}"
+    )
+
+    pair_dir = (
+        class_root
+        / pair_name
+    )
+
+    pair_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # Copy originals -- never modify them.
+    shutil.copy2(
+        start_path,
+        pair_dir
+        / f"start_original{start_path.suffix}",
+    )
+
+    shutil.copy2(
+        final_path,
+        pair_dir
+        / f"final_original{final_path.suffix}",
+    )
+
+    # Debugging outputs.
+    cv2.imwrite(
+        str(pair_dir / "start_processed.png"),
+        start,
+    )
+
+    cv2.imwrite(
+        str(pair_dir / "final_aligned.png"),
+        final_aligned,
+    )
+
+    cv2.imwrite(
+        str(pair_dir / "absolute_difference.png"),
+        map_to_uint8(abs_map),
+    )
+
+    cv2.imwrite(
+        str(pair_dir / "ssim_difference.png"),
+        map_to_uint8(ssim_map),
+    )
+
+    cv2.imwrite(
+        str(pair_dir / "gradient_difference.png"),
+        map_to_uint8(grad_map),
+    )
+
+    cv2.imwrite(
+        str(pair_dir / "combined_heatmap.png"),
+        make_heatmap(combined),
+    )
+
+    cv2.imwrite(
+        str(pair_dir / "defect_mask.png"),
+        defect_mask * 255,
+    )
+
+    overlay = make_overlay(
+        final_aligned,
+        defect_mask,
+    )
+
+    cv2.imwrite(
+        str(pair_dir / "detected_changes.png"),
+        overlay,
+    )
+
+    result = PairResult(
+        unit=unit,
+        pair_number=pair_number,
+
+        start_path=str(start_path),
+        final_path=str(final_path),
+
+        selected_rotation_deg=rotation,
+        ecc_score=ecc_score,
+
+        global_ssim=global_ssim,
+
+        changed_pixel_ratio=changed_ratio,
+        max_component_ratio=max_component_ratio,
+        max_component_area_px=max_component_area,
+        number_components=number_components,
+
+        threshold_used=threshold,
+        severity=severity,
+
+        classification=classification,
+        reason=reason,
+    )
+
+    with open(
+        pair_dir / "metrics.json",
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            asdict(result),
+            f,
+            indent=4,
+        )
+
+    return result
+
+
+# ============================================================
+# SAVE GLOBAL CSV
+# ============================================================
+
+def save_results_csv(
+    results: list[PairResult],
+) -> None:
+
+    if not results:
+        return
+
+    path = (
+        OUTPUT_ROOT
+        / "metrics.csv"
+    )
+
+    with open(
+        path,
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=list(
+                asdict(
+                    results[0]
+                ).keys()
+            ),
+        )
+
+        writer.writeheader()
+
+        for result in results:
+
+            writer.writerow(
+                asdict(result)
+            )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print("=" * 70)
+    print("START / FINAL CLASSICAL CHANGE DETECTOR")
+    print("=" * 70)
+
+    print(f"\nInput:")
+    print(INPUT_ROOT)
+
+    print(f"\nOutput:")
+    print(OUTPUT_ROOT)
+
+    if not INPUT_ROOT.exists():
+        raise FileNotFoundError(
+            f"Input folder does not exist:\n"
+            f"{INPUT_ROOT}"
+        )
+
+    OUTPUT_ROOT.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    starts, finals = discover_images(
+        INPUT_ROOT
+    )
+
+    print(
+        f"\nUnits with Start images: "
+        f"{len(starts)}"
+    )
+
+    print(
+        f"Units with Final images: "
+        f"{len(finals)}"
+    )
+
+    pairs = build_pairs(
+        starts,
+        finals,
+    )
+
+    print(
+        f"\nPairs found: {len(pairs)}"
+    )
+
+    if not pairs:
+
+        print(
+            "\nNo Start/Final pairs found."
+        )
+
+        print(
+            "Check INPUT_ROOT, START_TOKEN "
+            "and FINAL_TOKEN."
+        )
+
+        return
+
+    results: list[PairResult] = []
+
+    similar_count = 0
+    not_similar_count = 0
+
+    for index, (
+        unit,
+        pair_number,
+        start_path,
+        final_path,
+    ) in enumerate(
+        pairs,
+        start=1,
+    ):
+
+        print(
+            f"\n[{index}/{len(pairs)}] "
+            f"{unit} pair {pair_number}"
+        )
+
+        try:
+
+            result = process_pair(
+                unit,
+                pair_number,
+                start_path,
+                final_path,
+            )
+
+            results.append(result)
+
+            if (
+                result.classification
+                == "similar"
+            ):
+                similar_count += 1
+
+            else:
+                not_similar_count += 1
+
+            print(
+                f"  rotation : "
+                f"{result.selected_rotation_deg}°"
+            )
+
+            print(
+                f"  SSIM     : "
+                f"{result.global_ssim:.5f}"
+            )
+
+            print(
+                f"  changed  : "
+                f"{100 * result.changed_pixel_ratio:.4f}%"
+            )
+
+            print(
+                f"  max area : "
+                f"{result.max_component_area_px} px"
+            )
+
+            print(
+                f"  severity : "
+                f"{result.severity:.3f}"
+            )
+
+            print(
+                f"  RESULT   : "
+                f"{result.classification.upper()}"
+            )
+
+            print(
+                f"  reason   : "
+                f"{result.reason}"
+            )
+
+        except Exception as exc:
+
+            print(
+                f"  ERROR: {exc}"
+            )
+
+    save_results_csv(
+        results
+    )
+
+    print("\n" + "=" * 70)
+    print("FINISHED")
+    print("=" * 70)
+
+    print(
+        f"Similar:      "
+        f"{similar_count}"
+    )
+
+    print(
+        f"Not similar:  "
+        f"{not_similar_count}"
+    )
+
+    print(
+        f"Total:        "
+        f"{len(results)}"
+    )
+
+    print(
+        f"\nResults saved to:\n"
+        f"{OUTPUT_ROOT}"
+    )
+
+    print(
+        f"\nGlobal metrics:\n"
+        f"{OUTPUT_ROOT / 'metrics.csv'}"
+    )
+
+
+if __name__ == "__main__":
+    main()

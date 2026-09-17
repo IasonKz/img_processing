@@ -1,0 +1,39 @@
+$ErrorActionPreference = "Stop"
+
+if (!(Test-Path "inspection.py") -or !(Test-Path "project.yaml") -or !(Test-Path "requirements.txt")) {
+    throw "Δεν βρίσκεσαι στον σωστό φάκελο του project."
+}
+
+$V3Env = Join-Path $env:USERPROFILE "venvs\vip3"
+$V3Python = Join-Path $V3Env "Scripts\python.exe"
+
+py -3.12 --version
+if ($LASTEXITCODE -ne 0) { throw "Η Python 3.12 δεν βρέθηκε." }
+
+if (!(Test-Path $V3Python)) {
+    py -3.12 -m venv $V3Env
+    if ($LASTEXITCODE -ne 0) { throw "Απέτυχε η δημιουργία του vip3 environment." }
+}
+
+& $V3Python -m pip install --upgrade pip
+if ($LASTEXITCODE -ne 0) { throw "Απέτυχε η αναβάθμιση του pip." }
+
+& $V3Python -m pip install -r requirements.txt
+if ($LASTEXITCODE -ne 0) { throw "Απέτυχε η εγκατάσταση των βασικών dependencies." }
+
+& $V3Python -m pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
+if ($LASTEXITCODE -ne 0) { throw "Απέτυχε η εγκατάσταση PyTorch." }
+
+& $V3Python -m pip check
+if ($LASTEXITCODE -ne 0) { throw "Υπάρχει πρόβλημα συμβατότητας στα dependencies." }
+
+& $V3Python -c "import torch, torchvision; print('Python environment: OK'); print('Torch:', torch.__version__); print('Torchvision:', torchvision.__version__); print('Device: CPU')"
+if ($LASTEXITCODE -ne 0) { throw "Το PyTorch δεν φορτώνεται σωστά." }
+
+& $V3Python inspection.py download-weights --config project.yaml --profile laptop --task vig
+if ($LASTEXITCODE -ne 0) { throw "Απέτυχε το κατέβασμα των pretrained weights." }
+
+& $V3Python inspection.py doctor --config project.yaml --profile laptop --task vig
+if ($LASTEXITCODE -ne 0) { throw "Ο έλεγχος του project απέτυχε." }
+
+& $V3Python inspection.py dashboard --config project.yaml

@@ -1,0 +1,2 @@
+New-Item -ItemType Directory -Force -Path "C:\Users\laka\software\models\classify_v2\weights"
+Copy-Item -Path "C:\Users\laka\software\python_slanted_edge_automated\good_bad_dataset\my_models\Inspection_Studio_v4\weights\*" -Destination "C:\Users\laka\software\models\classify_v2\weights\"

@@ -31,8 +31,8 @@ SIDES = ("TOP", "BOTTOM")
 SHAPES = ("Polygon ROI", "Point / center", "Circle")
 PALETTE = ["#00e5ff", "#ffe600", "#ff55ff", "#4cff4c", "#ff8c42", "#ffffff", "#5da9ff"]
 HELP_TEXT = (
-    "Suggested order: first draw die_outline using exactly 4 clicks in this order: "
-    "top-left, top-right, bottom-right, bottom-left. Then mark inner_octagon, "
+    "Suggested order: first draw die_outline by clicking its 4 outer corners. "
+    "The tool orders those corners automatically. Then mark inner_octagon, "
     "label, corner_TL/TR/BL/BR and/or camera_center. Each ROI can have its own name and note."
 )
 
@@ -51,6 +51,22 @@ def polygon_area(points):
     return abs(sum(points[i][0] * points[(i + 1) % len(points)][1] -
                    points[(i + 1) % len(points)][0] * points[i][1]
                    for i in range(len(points))) / 2.0)
+
+
+def order_quad_clockwise(points):
+    """Return four corners in image-space TL, TR, BR, BL order.
+
+    The manual annotator may receive clicks in any order. Sorting around the
+    centroid and rotating to the upper-left corner avoids invalid homographies
+    when the user traces down the left side first.
+    """
+    pts = np.asarray(points, np.float64).reshape(4, 2)
+    center = pts.mean(axis=0)
+    angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
+    ordered = pts[np.argsort(angles)]
+    start = int(np.argmin(ordered[:, 0] + ordered[:, 1]))
+    ordered = np.roll(ordered, -start, axis=0)
+    return [[float(x), float(y)] for x, y in ordered]
 
 
 def homography_from_quad(quad):
@@ -317,9 +333,14 @@ class GeometryAnnotator:
             }[shape], parent=self.root)
             return
         if name.casefold() == "die_outline" and (shape != "Polygon ROI" or len(self.current_points) != 4):
-            messagebox.showwarning("die_outline requires 4 points", "Use Polygon ROI and click exactly four outer die corners in TL → TR → BR → BL order.", parent=self.root)
+            messagebox.showwarning("die_outline requires 4 points", "Use Polygon ROI and click exactly four distinct outer die corners. Their order is corrected automatically.", parent=self.root)
             return
         points = self.current_points[:expected] if shape != "Polygon ROI" else self.current_points[:]
+        if name.casefold() == "die_outline":
+            points = order_quad_clockwise(points)
+            if polygon_area(points) < 100:
+                messagebox.showwarning("Invalid die outline", "The four corner points do not form a valid die outline.", parent=self.root)
+                return
         if shape == "Polygon ROI" and polygon_area(points) < max(16.0, .000002*self.image_width*self.image_height):
             messagebox.showwarning("Polygon too small", "The polygon has almost no area. Add or reposition its vertices.", parent=self.root)
             return
@@ -497,8 +518,8 @@ class GeometryAnnotator:
                             "exif_orientation_applied":True},
             "coordinate_notes":[
                 "image_normalized_points range from 0 to 1 and are divided by image width-1 / height-1.",
-                "die_frame_normalized_points map the four die_outline clicks to [0,1]x[0,1].",
-                "For die_frame coordinates, die_outline must be clicked in TL,TR,BR,BL order.",
+                "die_frame_normalized_points map the four die_outline corners to [0,1]x[0,1].",
+                "The annotator automatically orders the four die_outline corners in image-space TL,TR,BR,BL order.",
                 "Image pixel coordinates refer to the EXIF-corrected image shown in the annotator."
             ],
             "die_frame_available":die_H is not None,
